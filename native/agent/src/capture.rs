@@ -3,7 +3,7 @@
 //! Cookie / 请求头 / 请求体只留在事务里；官方 UI 只拿到 [`PendingCaptureDto`] 摘要，
 //! 确认时提交表单产出的 [`CreateTaskRequest`]，由 [`merge_confirmed_request`] 以捕获原请求为底合并。
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use fluxdown_protocol::{
@@ -18,6 +18,56 @@ use crate::event_hub::AgentEventHub;
 use crate::shell::ShellState;
 
 const CAPTURE_CAPACITY: usize = 64;
+
+/// 「免打扰下载」：外部接管请求不弹确认，直接按默认设置建任务（设置页 `download.rs`）。
+pub(crate) const SILENT_DOWNLOAD_PREF: &str = "download.silent_download";
+/// 免打扰子开关：静默建的任务跳过 BT 文件 / HLS·DASH 画质 / 插件变体二次选择。设备本地偏好。
+pub(crate) const SILENT_SKIP_SELECTION_PREF: &str = "download.silent_skip_selection";
+/// 「跟随上次保存位置」与其记录（官方 UI 新建下载写入）。
+const REMEMBER_LAST_SAVE_DIR_PREF: &str = "download.remember_last_save_dir";
+const LAST_SAVE_DIR_PREF: &str = "download.last_save_dir";
+
+/// 捕获来源，决定是否需要用户确认。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureOrigin {
+    /// 本机用户显式交来的链接（系统打开链接、拖入）：直接建任务。
+    Direct,
+    /// 浏览器扩展 / 用户脚本 / NMH 等外部接管：按「免打扰下载」偏好静默或确认。
+    External,
+    /// 需要用户过目的探测结果（剪贴板监听）：恒入确认队列。
+    Prompt,
+}
+
+/// 外部接管的静默策略；由偏好现算，改动即生效。
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExternalPolicy {
+    silent: bool,
+    skip_selection: bool,
+    /// 「跟随上次保存位置」开启且有记录时的目录；捕获方未指定目录时使用。
+    remembered_save_dir: Option<String>,
+}
+
+impl ExternalPolicy {
+    fn from_preferences(preferences: &BTreeMap<String, Value>) -> Self {
+        let flag = |key: &str| {
+            preferences
+                .get(key)
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        let remembered_save_dir = flag(REMEMBER_LAST_SAVE_DIR_PREF)
+            .then(|| preferences.get(LAST_SAVE_DIR_PREF).and_then(Value::as_str))
+            .flatten()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+            .map(str::to_owned);
+        Self {
+            silent: flag(SILENT_DOWNLOAD_PREF),
+            skip_selection: flag(SILENT_SKIP_SELECTION_PREF),
+            remembered_save_dir,
+        }
+    }
+}
 
 struct CaptureTransaction {
     public: PendingCaptureDto,
@@ -43,35 +93,75 @@ impl CaptureService {
         }
     }
 
-    /// 静默策略直接提交 daemon；否则排入确认队列并在首项时唤起官方 UI。
+    /// 按来源分流：`Direct` 与开启免打扰的 `External` 直接提交 daemon，其余排入确认队列并在
+    /// 队列由空变非空时唤起官方 UI。批量请求（换行连接的多 URL）先拆成逐条请求。
+    ///
+    /// 保存目录优先级与 Flutter 一致：捕获方指定 > 分类目录 > （仅静默）跟随上次 > daemon 默认。
+    /// 确认路径把分类目录写进待确认摘要，官方表单据此预填。
     pub async fn submit(
         &self,
         request: DownloadRequest,
-        silent: bool,
+        origin: CaptureOrigin,
     ) -> Result<Value, CaptureError> {
-        if silent {
+        let requests = split_batch(request);
+        if origin == CaptureOrigin::Direct {
+            return self.create_all(requests, None, true).await;
+        }
+        let (policy, requests) = self.events.inspect(|snapshot| {
+            let preferences = &snapshot.preferences.values;
+            let requests = requests
+                .into_iter()
+                .map(|request| with_category_dir(request, preferences))
+                .collect::<Vec<_>>();
+            (ExternalPolicy::from_preferences(preferences), requests)
+        });
+        if origin == CaptureOrigin::External && policy.silent {
+            let save_dir = policy.remembered_save_dir.as_deref();
             return self
-                .create(captured_create_request(request), None, true)
+                .create_all(requests, save_dir, policy.skip_selection)
                 .await;
         }
-        let public = pending_capture_dto(&request);
-        let first = {
+        self.enqueue(requests).await
+    }
+
+    async fn create_all(
+        &self,
+        requests: Vec<DownloadRequest>,
+        fallback_save_dir: Option<&str>,
+        unattended: bool,
+    ) -> Result<Value, CaptureError> {
+        let mut task_ids = Vec::with_capacity(requests.len());
+        for request in requests {
+            let mut create = captured_create_request(request);
+            if let Some(dir) = fallback_save_dir {
+                fill_if_blank(&mut create.save_dir, dir.to_owned());
+            }
+            let created = self.create(create, None, unattended).await?;
+            task_ids.push(created.get("taskId").cloned().unwrap_or(Value::Null));
+        }
+        Ok(json!({ "taskIds": task_ids }))
+    }
+
+    async fn enqueue(&self, requests: Vec<DownloadRequest>) -> Result<Value, CaptureError> {
+        let (first, transaction_ids) = {
             let mut pending = self.pending.lock().await;
-            if pending.len() >= CAPTURE_CAPACITY {
+            if pending.len() + requests.len() > CAPTURE_CAPACITY {
                 return Err(CaptureError::Full);
             }
             let first = pending.is_empty();
-            pending.push_back(CaptureTransaction {
-                public: public.clone(),
-                request,
-            });
-            first
+            let mut transaction_ids = Vec::with_capacity(requests.len());
+            for request in requests {
+                let public = pending_capture_dto(&request);
+                transaction_ids.push(public.transaction_id.clone());
+                pending.push_back(CaptureTransaction { public, request });
+            }
+            (first, transaction_ids)
         };
         self.publish().await;
         if first {
             self.shell.launch_for_prompt();
         }
-        Ok(json!({ "transactionId": public.transaction_id }))
+        Ok(json!({ "transactionIds": transaction_ids }))
     }
 
     /// 用户选定的本机 `.torrent`（已上传为 daemon blob）直接建任务；
@@ -177,6 +267,52 @@ fn pending_capture_dto(request: &DownloadRequest) -> PendingCaptureDto {
         has_cookies: !request.cookies.trim().is_empty() || cookie_header,
         header_names,
     }
+}
+
+/// 捕获方未指定保存目录时按分类规则补上（命中且该分类配置了目录）。
+fn with_category_dir(
+    mut request: DownloadRequest,
+    preferences: &BTreeMap<String, Value>,
+) -> DownloadRequest {
+    if request.save_dir.trim().is_empty()
+        && let Some(dir) =
+            crate::category_dir::category_save_dir(preferences, &request.filename, &request.url)
+    {
+        request.save_dir = dir;
+    }
+    request
+}
+
+/// `/download/batch` 把多个 URL 以换行连接成单个请求（`fluxdown_api::takeover::parse_batch`）；
+/// 建任务与确认事务都必须逐 URL 进行，否则 daemon 收到多行 URL，确认表单也会把它们拆成与事务
+/// 对不上的普通链接而丢掉 Cookie / Referer / 请求头。单 URL 原样保留；多 URL 只共享
+/// Cookie / Referer / 请求头 / 保存目录，文件名 / method / body / 音频轨 / 大小是单请求语义，丢弃。
+fn split_batch(request: DownloadRequest) -> Vec<DownloadRequest> {
+    let urls = request
+        .url
+        .lines()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if urls.len() <= 1 {
+        return vec![request];
+    }
+    urls.into_iter()
+        .map(|url| DownloadRequest {
+            url,
+            filename: String::new(),
+            save_dir: request.save_dir.clone(),
+            referrer: request.referrer.clone(),
+            cookies: request.cookies.clone(),
+            headers: request.headers.clone(),
+            file_size: None,
+            mime_type: None,
+            method: None,
+            body: None,
+            audio_url: None,
+        })
+        .collect()
 }
 
 /// 按捕获原请求建任务（静默提交 / 未带表单结果的确认）；队列与分段走 daemon 默认。
@@ -359,10 +495,110 @@ pub enum BlobError {
 mod tests {
     use std::collections::HashMap;
 
-    use fluxdown_protocol::{CreateTaskRequest, RequestBody};
+    use fluxdown_protocol::{AgentSnapshot, CreateTaskRequest, RequestBody};
     use serde_json::json;
 
-    use super::{DownloadRequest, merge_confirmed_request, pending_capture_dto};
+    use super::{
+        CaptureOrigin, CaptureService, DownloadRequest, ExternalPolicy, merge_confirmed_request,
+        pending_capture_dto, split_batch, with_category_dir,
+    };
+
+    fn preferences(
+        value: serde_json::Value,
+    ) -> std::collections::BTreeMap<String, serde_json::Value> {
+        serde_json::from_value(value).expect("preference map")
+    }
+
+    /// 断开的 daemon：静默路径的建任务调用必然失败，从而可观察「没有入确认队列」。
+    fn service(prefs: serde_json::Value) -> CaptureService {
+        let daemon = std::sync::Arc::new(crate::daemon_client::DaemonClient::disconnected());
+        let mut snapshot = AgentSnapshot::default();
+        snapshot.preferences.values = preferences(prefs);
+        let events = crate::event_hub::AgentEventHub::new(snapshot);
+        let shell = crate::shell::ShellState::new(
+            crate::shell::TrayAvailability::Unavailable(
+                fluxdown_protocol::TrayUnavailableReason::NotBuilt,
+            ),
+            daemon.clone(),
+            events.clone(),
+        );
+        CaptureService::new(daemon, events, shell)
+    }
+
+    #[test]
+    fn external_policy_follows_silent_preferences_and_remembered_dir() {
+        let off = ExternalPolicy::from_preferences(&preferences(json!({})));
+        assert!(!off.silent);
+        assert!(!off.skip_selection);
+        assert_eq!(off.remembered_save_dir, None);
+
+        let on = ExternalPolicy::from_preferences(&preferences(json!({
+            "download.silent_download": true,
+            "download.silent_skip_selection": true,
+            "download.remember_last_save_dir": true,
+            "download.last_save_dir": "  /last  ",
+        })));
+        assert!(on.silent);
+        assert!(on.skip_selection);
+        assert_eq!(on.remembered_save_dir.as_deref(), Some("/last"));
+
+        // 「跟随上次」关闭时忽略记录；旧的无命名空间子开关键不生效。
+        let not_remembered = ExternalPolicy::from_preferences(&preferences(json!({
+            "download.silent_download": true,
+            "silent_skip_selection": true,
+            "download.last_save_dir": "/last",
+        })));
+        assert!(!not_remembered.skip_selection);
+        assert_eq!(not_remembered.remembered_save_dir, None);
+    }
+
+    #[tokio::test]
+    async fn silent_external_capture_creates_directly_instead_of_prompting() {
+        let capture = service(json!({ "download.silent_download": true }));
+        let result = capture.submit(captured(), CaptureOrigin::External).await;
+        assert!(matches!(result, Err(super::CaptureError::Daemon(_))));
+        assert!(capture.list().await.is_empty());
+    }
+
+    #[test]
+    fn category_dir_fills_only_unspecified_save_dir() {
+        let prefs = preferences(json!({
+            "custom_categories": [{
+                "id": "bin", "name": "bin", "extensions": ["bin"], "position": 1,
+                "saveDir": "/category",
+            }],
+        }));
+        assert_eq!(with_category_dir(captured(), &prefs).save_dir, "/captured");
+        let mut unspecified = captured();
+        unspecified.save_dir = String::new();
+        assert_eq!(with_category_dir(unspecified, &prefs).save_dir, "/category");
+    }
+
+    #[test]
+    fn batch_request_splits_per_url_sharing_only_request_context() {
+        let mut batch = captured();
+        batch.url = "https://example.com/a.bin\n\n  https://example.com/b.bin  \n".to_owned();
+        let split = split_batch(batch);
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].url, "https://example.com/a.bin");
+        assert_eq!(split[1].url, "https://example.com/b.bin");
+        for request in &split {
+            assert_eq!(request.cookies, "sid=1");
+            assert_eq!(request.referrer, "https://example.com/page");
+            assert_eq!(request.save_dir, "/captured");
+            assert_eq!(request.headers, captured().headers);
+            assert!(request.filename.is_empty());
+            assert!(request.method.is_none() && request.body.is_none());
+            assert!(request.audio_url.is_none() && request.file_size.is_none());
+        }
+
+        let single = split_batch(captured());
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].url, "https://example.com/a.bin");
+        assert_eq!(single[0].filename, "a.bin");
+        assert_eq!(single[0].method.as_deref(), Some("POST"));
+        assert!(single[0].audio_url.is_some());
+    }
 
     fn captured() -> DownloadRequest {
         DownloadRequest {

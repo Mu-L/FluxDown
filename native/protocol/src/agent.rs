@@ -390,6 +390,10 @@ fn default_gateway_port() -> u16 {
 }
 
 /// 原子修改 agent 托管的兼容网关开关与用户 token。
+///
+/// 管理 API / MCP 端点强制鉴权：`api_enabled` 或 `mcp_enabled` 由关转开且（应用本次
+/// `user_token` 后）用户 token 仍为空时，agent 自动生成随机 token；反之显式把 token
+/// 清空（且本次未开启上述开关）时，agent 同时关闭 `api_enabled` 与 `mcp_enabled`。
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]

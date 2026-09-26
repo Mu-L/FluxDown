@@ -102,30 +102,15 @@ pub async fn run(cancel: CancellationToken, host: ShellHost) -> AgentResult {
         rpc_url: paths.daemon_rpc_url.clone(),
         bearer: daemon_bearer,
     };
-    let (daemon, mut daemon_events) =
-        DaemonClient::start(daemon_config.clone(), supervisor.clone())?;
+    let (daemon, daemon_events) =
+        DaemonClient::start(daemon_config.clone(), supervisor.clone(), cancel.clone())?;
     let daemon = Arc::new(daemon);
-    daemon
-        .wait_ready(Duration::from_secs(30))
-        .await
-        .map_err(|error| {
-            std::io::Error::other(format!("daemon startup failed: {:?}", error.code))
-        })?;
-    let initial_daemon = match tokio::time::timeout(Duration::from_secs(5), daemon_events.recv())
-        .await
-    {
-        Ok(Some(DaemonClientEvent::Snapshot(snapshot))) => match snapshot.body {
-            fluxdown_protocol::SnapshotBody::Daemon(daemon) => *daemon,
-            _ => return Err(std::io::Error::other("daemon returned wrong snapshot role").into()),
-        },
-        Ok(Some(_)) | Ok(None) | Err(_) => {
-            return Err(std::io::Error::other("daemon returned no initial snapshot").into());
-        }
-    };
 
+    // 不等 daemon 就绪就开 Gateway：首个快照先带偏好 / 外壳状态（`daemon_connected=false`），
+    // 界面据此立即决定主题、语言与启动时是否只驻留托盘；daemon 连上后由投影任务替换
+    // daemon 快照并发布 `DaemonConnectionChanged(true)`，与运行期断线重连同一路径。
     let initial = AgentSnapshot {
-        daemon: initial_daemon,
-        daemon_connected: true,
+        daemon_connected: false,
         session: state
             .credentials
             .as_ref()
@@ -162,20 +147,31 @@ pub async fn run(cancel: CancellationToken, host: ShellHost) -> AgentResult {
         crate::analytics::AnalyticsWorker::new(shared_state.clone(), store.clone())?
             .run(cancel.clone()),
     );
-    crate::link::migrate_legacy_state(&daemon, &shared_state, &store, &events).await?;
     let (api_config, api_switches, api_token) = {
         let state = shared_state.lock().await;
+        // legacy Gateway 设置（含用户令牌）尚未从 daemon 迁入时，空令牌意味着兼容 API 不鉴权：
+        // 迁移完成前兼容面全部关闭，由 readiness 任务按迁移后的状态开启。
+        let migrated = state.gateway_migration_revision.is_some();
         let switches = Arc::new(fluxdown_api::server::ApiRuntimeSwitches::new(
-            state.gateway.takeover_enabled,
-            state.gateway.jsonrpc_enabled,
-            state.gateway.api_enabled,
-            state.gateway.mcp_enabled,
+            migrated && state.gateway.takeover_enabled,
+            migrated && state.gateway.jsonrpc_enabled,
+            migrated && state.gateway.api_enabled,
+            migrated && state.gateway.mcp_enabled,
             state.gateway.cors_enabled,
         ));
         let config = compatibility_api_config(&state).with_runtime_switches(switches.clone());
         let token = config.token.clone();
         (config, switches, token)
     };
+    let readiness_task = tokio::spawn(await_daemon_ready(DaemonReadiness {
+        daemon: daemon.clone(),
+        state: shared_state.clone(),
+        store: store.clone(),
+        events: events.clone(),
+        api_switches: api_switches.clone(),
+        api_token: api_token.clone(),
+        cancel: cancel.clone(),
+    }));
     let cloud_client = crate::cloud::CloudClient::new(
         std::env::var("FLUXCLOUD_BASE_URL")
             .ok()
@@ -231,6 +227,7 @@ pub async fn run(cancel: CancellationToken, host: ShellHost) -> AgentResult {
         shared_state.clone(),
         store.clone(),
         api_switches.clone(),
+        api_token.clone(),
     ));
     let update = Arc::new(crate::update::UpdateService::new(env!(
         "CARGO_PKG_VERSION"
@@ -303,6 +300,11 @@ pub async fn run(cancel: CancellationToken, host: ShellHost) -> AgentResult {
         }
     };
     cancel.cancel();
+    // daemon 启动失败 / 迁移失败时 readiness 任务取消了 Gateway：以它的错误作为退出原因。
+    let result = match (result, readiness_task.await) {
+        (Ok(()), Ok(Err(error))) => Err(error),
+        (result, _) => result,
+    };
     let _ = event_task.await;
     let _ = cdn_task.await;
     let _ = sync_task.await;
@@ -315,6 +317,60 @@ pub async fn run(cancel: CancellationToken, host: ShellHost) -> AgentResult {
         let _ = nmh_task.await;
     }
     result
+}
+
+/// 后台等待 daemon 的依赖集合。
+struct DaemonReadiness {
+    daemon: Arc<DaemonClient>,
+    state: Arc<tokio::sync::Mutex<AgentState>>,
+    store: Arc<StateStore>,
+    events: AgentEventHub,
+    api_switches: Arc<fluxdown_api::server::ApiRuntimeSwitches>,
+    api_token: fluxdown_api::auth::TokenCell,
+    cancel: CancellationToken,
+}
+
+/// Gateway 已先行服务；这里等 daemon 首次就绪并完成一次性 legacy 迁移。失败即取消 agent，
+/// 语义与原先「就绪前阻塞启动」一致。迁移可能改写兼容 API 开关与令牌，完成后同步到运行期。
+async fn await_daemon_ready(readiness: DaemonReadiness) -> AgentResult {
+    let DaemonReadiness {
+        daemon,
+        state,
+        store,
+        events,
+        api_switches,
+        api_token,
+        cancel,
+    } = readiness;
+    let work = async {
+        daemon
+            .wait_ready(Duration::from_secs(30))
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("daemon startup failed: {:?}", error.code))
+            })?;
+        crate::link::migrate_legacy_state(&daemon, &state, &store, &events).await?;
+        let state = state.lock().await;
+        api_switches.update(
+            state.gateway.takeover_enabled,
+            state.gateway.jsonrpc_enabled,
+            state.gateway.api_enabled,
+            state.gateway.mcp_enabled,
+            state.gateway.cors_enabled,
+        );
+        api_token.set(state.gateway_user_token.clone());
+        Ok(())
+    };
+    // agent 退出（信号 / 托盘退出 / daemon 致命错误）时不再等待，避免拖住关停。
+    let outcome: AgentResult = tokio::select! {
+        _ = cancel.cancelled() => Ok(()),
+        outcome = work => outcome,
+    };
+    if let Err(error) = &outcome {
+        tracing::error!(error = %error, "fluxdown-agent could not reach fluxdownd");
+        cancel.cancel();
+    }
+    outcome
 }
 
 fn spawn_daemon_projection(

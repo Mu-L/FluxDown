@@ -313,11 +313,17 @@ impl DownloadView {
         if let Some(detail) = self.detail.clone() {
             detail.update(cx, |detail, cx| detail.apply_event(event, cx));
         }
-        if let fluxdown_protocol::ServiceEvent::Agent(
-            fluxdown_protocol::AgentEvent::PreferencesChanged(_),
-        ) = event
-        {
-            self.load_view_prefs(cx);
+        match event {
+            fluxdown_protocol::ServiceEvent::Agent(
+                fluxdown_protocol::AgentEvent::PreferencesChanged(_),
+            ) => self.load_view_prefs(cx),
+            // agent 先于 daemon 就绪时首个快照即为未连接；连接态以事件为准，横幅随之出现 / 消失。
+            fluxdown_protocol::ServiceEvent::Agent(
+                fluxdown_protocol::AgentEvent::DaemonConnectionChanged(connected),
+            ) => {
+                self.last_error = (!connected).then(|| self.strings.disconnected.clone());
+            }
+            _ => {}
         }
         if table_changed {
             if matches!(

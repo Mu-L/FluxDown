@@ -7,6 +7,7 @@ pub mod analytics;
 pub mod api_host;
 pub mod background_effects;
 pub mod capture;
+mod category_dir;
 pub mod cdn_worker;
 #[cfg(feature = "desktop")]
 pub mod clipboard_watch;

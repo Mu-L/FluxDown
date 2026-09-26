@@ -114,7 +114,11 @@ impl NmhService {
         match message.action.as_str() {
             "ping" => PipeResponse::ok(message.msg_id, "pong"),
             "download" => match serde_json::from_value::<DownloadRequest>(message.payload) {
-                Ok(request) => match self.capture.submit(request, false).await {
+                Ok(request) => match self
+                    .capture
+                    .submit(request, crate::capture::CaptureOrigin::External)
+                    .await
+                {
                     Ok(_) => PipeResponse::ok(message.msg_id, "download accepted"),
                     Err(error) => PipeResponse::error(message.msg_id, error.to_string()),
                 },
@@ -148,7 +152,11 @@ impl NmhService {
         };
         let count = batch.items.len();
         for request in batch.items {
-            if let Err(error) = self.capture.submit(request, false).await {
+            if let Err(error) = self
+                .capture
+                .submit(request, crate::capture::CaptureOrigin::External)
+                .await
+            {
                 return PipeResponse::error(msg_id, error.to_string());
             }
         }

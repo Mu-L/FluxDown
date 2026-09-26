@@ -39,7 +39,18 @@ impl CategoryIndex {
                 let matcher = match (dto.builtin_type.as_deref(), dto.match_mode.as_str()) {
                     (Some("all"), _) => Matcher::All,
                     (Some("other"), _) => Matcher::Other,
-                    (_, "regex") => Matcher::Regex(regex::Regex::new(&dto.regex_pattern).ok()),
+                    // 与 Flutter `CustomCategory.matches` 及 agent 分类目录解析一致：正则不区分
+                    // 大小写，空模式不匹配（Rust 空正则会匹配一切）。
+                    (_, "regex") => Matcher::Regex(
+                        (!dto.regex_pattern.is_empty())
+                            .then(|| {
+                                regex::RegexBuilder::new(&dto.regex_pattern)
+                                    .case_insensitive(true)
+                                    .build()
+                                    .ok()
+                            })
+                            .flatten(),
+                    ),
                     _ => Matcher::Extensions(
                         dto.extensions
                             .iter()
@@ -157,8 +168,23 @@ mod tests {
             builtin_type: None,
             save_dir: String::new(),
         });
+        dtos.push(CustomCategoryDto {
+            id: "empty".to_owned(),
+            name: "Empty".to_owned(),
+            icon: "file".to_owned(),
+            match_mode: "regex".to_owned(),
+            extensions: Vec::new(),
+            regex_pattern: String::new(),
+            position: 11,
+            visible: true,
+            is_builtin: false,
+            builtin_type: None,
+            save_dir: String::new(),
+        });
         let index = CategoryIndex::from_dtos(dtos);
         assert!(index.matches("c1", &task("show.S01E02.mkv")));
+        assert!(index.matches("c1", &task("show.s01e02.mkv")));
         assert!(!index.matches("bad", &task("anything")));
+        assert!(!index.matches("empty", &task("anything.mkv")));
     }
 }

@@ -20,6 +20,8 @@ pub struct ServiceBootstrap {
     state: Arc<Mutex<BootstrapState>>,
     /// 完全退出或 agent 已声明退出后置位：此后连接拒绝不再拉起 agent。
     stopped: AtomicBool,
+    /// 本进程曾拉起过 agent（即本次启动是 FluxDown 服务的冷启动）。
+    spawned: AtomicBool,
 }
 
 impl ServiceBootstrap {
@@ -28,12 +30,19 @@ impl ServiceBootstrap {
         Self {
             state: Arc::new(Mutex::new(BootstrapState::default())),
             stopped: AtomicBool::new(false),
+            spawned: AtomicBool::new(false),
         }
     }
 
     /// 永久停止拉起 agent（不可恢复）。
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
+    }
+
+    /// 本进程是否拉起过 agent：界面启动时据此区分「冷启动服务」与「打开已驻留的应用」。
+    #[must_use]
+    pub fn spawned_agent(&self) -> bool {
+        self.spawned.load(Ordering::Acquire)
     }
 
     /// 仅由 connection-refused/no-listener 路径调用。
@@ -62,6 +71,7 @@ impl ServiceBootstrap {
         state.generation = state.generation.saturating_add(1);
         let generation = state.generation;
         state.running = true;
+        self.spawned.store(true, Ordering::Release);
         let bootstrap_state = self.state.clone();
         state.reapers.push(tokio::spawn(async move {
             let _ = child.wait().await;

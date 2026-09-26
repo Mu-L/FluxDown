@@ -40,6 +40,14 @@ pub fn install(cx: &mut App) {
             | ServiceEvent::Daemon(DaemonEvent::SelectionPending(request)) => {
                 open(cx, request.clone());
             }
+            // daemon 晚于 agent 就绪 / 重连：挂起的选择随替换快照到达，而不是逐条事件。
+            ServiceEvent::Agent(AgentEvent::DaemonSnapshotReplaced(snapshot))
+            | ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::SnapshotReplaced(snapshot)))
+            | ServiceEvent::Daemon(DaemonEvent::SnapshotReplaced(snapshot)) => {
+                for request in snapshot.pending_selections.clone() {
+                    open(cx, request);
+                }
+            }
             ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::SelectionResolved {
                 request_id,
             }))

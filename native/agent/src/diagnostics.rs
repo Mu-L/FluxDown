@@ -64,6 +64,7 @@ pub struct DiagnosticsService {
     state: Arc<Mutex<AgentState>>,
     store: Arc<StateStore>,
     api_switches: Arc<fluxdown_api::server::ApiRuntimeSwitches>,
+    api_token: fluxdown_api::auth::TokenCell,
 }
 
 impl DiagnosticsService {
@@ -75,6 +76,7 @@ impl DiagnosticsService {
         state: Arc<Mutex<AgentState>>,
         store: Arc<StateStore>,
         api_switches: Arc<fluxdown_api::server::ApiRuntimeSwitches>,
+        api_token: fluxdown_api::auth::TokenCell,
     ) -> Self {
         Self {
             daemon,
@@ -83,6 +85,7 @@ impl DiagnosticsService {
             state,
             store,
             api_switches,
+            api_token,
         }
     }
 
@@ -306,8 +309,12 @@ impl DiagnosticsService {
     /// 与 `agent.gateway.patch` 同一条路径：持久化 → 运行时开关 → 广播 `GatewayChanged`。
     async fn enable_service(&self) -> Result<(), DiagnosticsError> {
         let mut state = self.state.lock().await;
+        let api_was_enabled = state.gateway.api_enabled;
+        let mcp_was_enabled = state.gateway.mcp_enabled;
         state.gateway.api_enabled = true;
+        crate::gateway::ensure_forced_auth_token(&mut state, api_was_enabled, mcp_was_enabled);
         let gateway = state.gateway.clone();
+        let user_token = state.gateway_user_token.clone();
         self.store.save(&state).await?;
         drop(state);
         self.api_switches.update(
@@ -317,6 +324,7 @@ impl DiagnosticsService {
             gateway.mcp_enabled,
             gateway.cors_enabled,
         );
+        self.api_token.set(user_token);
         self.events
             .publish(fluxdown_protocol::AgentEvent::GatewayChanged(gateway));
         Ok(())

@@ -20,6 +20,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, header};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_util::sync::CancellationToken;
 
 use crate::supervisor::DaemonSupervisor;
 
@@ -68,24 +69,33 @@ struct ClientCommand {
     ack: oneshot::Sender<Result<Value, RpcErrorData>>,
 }
 
+/// 首次连上 daemon 之前（agent 冷启动，Gateway 已先行服务）的调用等待上限，与 agent 启动
+/// 就绪预算一致：期间到达的捕获 / 兼容 API / 迁移等调用等 daemon 就绪后送达，而不是直接失败。
+const STARTUP_CALL_WAIT: Duration = Duration::from_secs(30);
+
 /// 可克隆的 daemon 调用入口。
 #[derive(Clone)]
 pub struct DaemonClient {
     commands: mpsc::Sender<ClientCommand>,
     connected: Arc<AtomicBool>,
+    /// 首次连接已有结论（连上过，或重连任务已终止）：此后断线期间的调用立即失败。
+    settled: Arc<AtomicBool>,
     ready: Arc<Notify>,
+    cancel: CancellationToken,
 }
 
 impl DaemonClient {
-    /// 启动重连任务与有界事件流。
+    /// 启动重连任务与有界事件流；`cancel` 触发后不再为首次连接等待。
     pub fn start(
         config: DaemonClientConfig,
         supervisor: Arc<DaemonSupervisor>,
+        cancel: CancellationToken,
     ) -> Result<(Self, mpsc::Receiver<DaemonClientEvent>), DaemonClientError> {
         config.validate()?;
         let (commands, command_rx) = mpsc::channel(64);
         let (events, event_rx) = mpsc::channel(1024);
         let connected = Arc::new(AtomicBool::new(false));
+        let settled = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(Notify::new());
         tokio::spawn(run_client(
             config,
@@ -93,25 +103,44 @@ impl DaemonClient {
             command_rx,
             events,
             connected.clone(),
-            ready.clone(),
+            SettleOnExit {
+                settled: settled.clone(),
+                ready: ready.clone(),
+            },
         ));
         Ok((
             Self {
                 commands,
                 connected,
+                settled,
                 ready,
+                cancel,
             },
             event_rx,
         ))
     }
 
-    /// 提交类型化 RPC 调用。
+    /// 当前是否已连上 daemon（不等待）。
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// 提交类型化 RPC 调用。首次连上之前等待就绪（有上限）；之后断线期间立即失败。
     pub async fn call<P: Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
         params: Option<P>,
     ) -> Result<R, RpcErrorData> {
-        if !self.connected.load(Ordering::Acquire) {
+        if !self.is_connected() && !self.settled.load(Ordering::Acquire) {
+            tokio::select! {
+                _ = self.cancel.cancelled() => {}
+                _ = self.wait_until(STARTUP_CALL_WAIT, || {
+                    self.is_connected() || self.settled.load(Ordering::Acquire)
+                }) => {}
+            }
+        }
+        if !self.is_connected() {
             return Err(unavailable_error());
         }
         let params = match params {
@@ -132,15 +161,24 @@ impl DaemonClient {
     }
 
     pub async fn wait_ready(&self, timeout: Duration) -> Result<(), RpcErrorData> {
-        if self.connected.load(Ordering::Acquire) {
-            return Ok(());
-        }
+        self.wait_until(timeout, || self.is_connected()).await
+    }
+
+    /// 等 `done` 成立；先登记唤醒再检查条件，连接恰在检查与等待之间建立也不会漏掉通知。
+    async fn wait_until(
+        &self,
+        timeout: Duration,
+        done: impl Fn() -> bool,
+    ) -> Result<(), RpcErrorData> {
         tokio::time::timeout(timeout, async {
             loop {
-                self.ready.notified().await;
-                if self.connected.load(Ordering::Acquire) {
+                let notified = self.ready.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if done() {
                     return;
                 }
+                notified.await;
             }
         })
         .await
@@ -148,15 +186,37 @@ impl DaemonClient {
     }
 }
 
+/// 重连任务退出（协议不兼容 / 致命错误）时结束首次连接等待，调用方不再空等到上限。
+struct SettleOnExit {
+    settled: Arc<AtomicBool>,
+    ready: Arc<Notify>,
+}
+
+impl SettleOnExit {
+    fn settle(&self) {
+        self.settled.store(true, Ordering::Release);
+        self.ready.notify_waiters();
+    }
+}
+
+impl Drop for SettleOnExit {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
 #[cfg(test)]
 impl DaemonClient {
+    /// 已断线（首次连接已有结论）的客户端：调用立即失败。
     pub(crate) fn disconnected() -> Self {
         let (commands, receiver) = mpsc::channel(1);
         drop(receiver);
         Self {
             commands,
             connected: Arc::new(AtomicBool::new(false)),
+            settled: Arc::new(AtomicBool::new(true)),
             ready: Arc::new(Notify::new()),
+            cancel: CancellationToken::new(),
         }
     }
 }
@@ -173,7 +233,7 @@ async fn run_client(
     mut commands: mpsc::Receiver<ClientCommand>,
     events: mpsc::Sender<DaemonClientEvent>,
     connected: Arc<AtomicBool>,
-    ready: Arc<Notify>,
+    settle: SettleOnExit,
 ) {
     let backoff = [1_u64, 2, 5, 15, 30];
     let mut attempt = 0_usize;
@@ -189,7 +249,7 @@ async fn run_client(
                 polled_child = None;
                 startup_polls = 0;
                 connected.store(true, Ordering::Release);
-                ready.notify_waiters();
+                settle.settle();
                 let snapshot_cursor = (snapshot.epoch.clone(), snapshot.sequence);
                 if events
                     .send(DaemonClientEvent::Snapshot(snapshot))
@@ -572,6 +632,82 @@ mod tests {
         let error = result.expect_err("disconnected command must fail");
         assert_eq!(error.code, ApplicationErrorCode::Unavailable);
         assert!(error.retryable);
+    }
+
+    fn pending_client() -> (
+        DaemonClient,
+        tokio::sync::mpsc::Receiver<super::ClientCommand>,
+        super::SettleOnExit,
+    ) {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let (commands, receiver) = tokio::sync::mpsc::channel(1);
+        let settled = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let client = DaemonClient {
+            commands,
+            connected: Arc::new(AtomicBool::new(false)),
+            settled: settled.clone(),
+            ready: ready.clone(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        (client, receiver, super::SettleOnExit { settled, ready })
+    }
+
+    #[tokio::test]
+    async fn call_before_first_connection_is_delivered_once_connected() {
+        let (client, mut commands, settle) = pending_client();
+        let caller = client.clone();
+        let call = tokio::spawn(async move {
+            caller
+                .call::<serde_json::Value, serde_json::Value>("task.create", None)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !call.is_finished(),
+            "call must wait for the first connection"
+        );
+        client
+            .connected
+            .store(true, std::sync::atomic::Ordering::Release);
+        settle.settle();
+        let command = commands.recv().await.expect("command delivered");
+        assert_eq!(command.method, "task.create");
+        let _ = command.ack.send(Ok(serde_json::json!({"ok": true})));
+        let result = call.await.expect("join").expect("call succeeds");
+        assert_eq!(result, serde_json::json!({"ok": true}));
+    }
+
+    #[tokio::test]
+    async fn call_fails_fast_when_client_gives_up_or_agent_cancels() {
+        let (client, _commands, settle) = pending_client();
+        let caller = client.clone();
+        let call = tokio::spawn(async move {
+            caller
+                .call::<serde_json::Value, serde_json::Value>("task.create", None)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(settle);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), call)
+            .await
+            .expect("must not wait for the startup budget")
+            .expect("join")
+            .expect_err("never connected");
+        assert_eq!(error.code, ApplicationErrorCode::Unavailable);
+
+        let (client, _commands, _settle) = pending_client();
+        client.cancel.cancel();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.call::<serde_json::Value, serde_json::Value>("task.create", None),
+        )
+        .await
+        .expect("cancelled agent must not wait")
+        .expect_err("never connected");
+        assert_eq!(error.code, ApplicationErrorCode::Unavailable);
     }
 
     #[tokio::test]

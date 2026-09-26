@@ -196,6 +196,12 @@ impl ShellState {
         if want == *subscribed && !(force && want) {
             return;
         }
+        // 未连接时不调用：首次连接前调用会等待 daemon 就绪，而这里在 UI 握手路径上，
+        // 等待会拖住首个快照。连上后 `DaemonConnectionChanged(true)` 强制补订。
+        if !self.daemon.is_connected() {
+            *subscribed = false;
+            return;
+        }
         let method_name = if want {
             method::DAEMON_SELECTION_SUBSCRIBE
         } else {

@@ -7,7 +7,7 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
-use fluxdown_protocol::capture_link;
+use fluxdown_protocol::{AgentSnapshot, capture_link};
 
 /// 已解析的命令行。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -44,6 +44,33 @@ impl LaunchOptions {
         }
         options
     }
+
+    /// 普通启动：没有外部链接 / 种子文件，也不是自启 / 确认 / 唤起模式。
+    #[must_use]
+    pub fn is_plain(&self) -> bool {
+        !self.minimized
+            && !self.capture_only
+            && !self.activate_existing
+            && self.urls.is_empty()
+            && self.torrent_files.is_empty()
+    }
+}
+
+/// 「启动时最小化到托盘」偏好键（agent 偏好，与 agent 自启判定同一键）。
+const START_MINIMIZED_TO_TRAY_KEY: &str = "start_minimized_to_tray";
+
+/// 本进程冷启动了 FluxDown 服务时，是否只留托盘而不开主窗口：偏好开启且托盘确实可见
+/// （可用且驻留），否则隐藏主窗口会留下既无窗口也无托盘的状态。
+#[must_use]
+pub fn start_in_tray(snapshot: &AgentSnapshot) -> bool {
+    snapshot.shell.tray_available
+        && snapshot.shell.resident
+        && snapshot
+            .preferences
+            .values
+            .get(START_MINIMIZED_TO_TRAY_KEY)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// `.torrent` 路径或 `file://` URL → 已存在的本机文件路径。
@@ -112,6 +139,44 @@ mod tests {
             Some(file.clone())
         );
         let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn start_in_tray_requires_preference_and_visible_tray() {
+        let snapshot = |pref: Option<bool>, available: bool, resident: bool| {
+            let mut snapshot = AgentSnapshot::default();
+            if let Some(pref) = pref {
+                snapshot
+                    .preferences
+                    .values
+                    .insert(START_MINIMIZED_TO_TRAY_KEY.to_owned(), pref.into());
+            }
+            snapshot.shell.tray_available = available;
+            snapshot.shell.resident = resident;
+            snapshot
+        };
+        assert!(start_in_tray(&snapshot(Some(true), true, true)));
+        assert!(!start_in_tray(&snapshot(None, true, true)));
+        assert!(!start_in_tray(&snapshot(Some(false), true, true)));
+        // 托盘不可用或未驻留（关闭了「关闭时最小化到托盘」）：隐藏会让应用无处可见。
+        assert!(!start_in_tray(&snapshot(Some(true), false, true)));
+        assert!(!start_in_tray(&snapshot(Some(true), true, false)));
+    }
+
+    #[test]
+    fn only_bare_launch_is_plain() {
+        assert!(LaunchOptions::from_args(Vec::<String>::new()).is_plain());
+        for arg in [
+            "--minimized",
+            "--capture",
+            "--activate-existing",
+            "magnet:?xt=urn:btih:abc",
+        ] {
+            assert!(
+                !LaunchOptions::from_args([arg.to_owned()]).is_plain(),
+                "{arg}"
+            );
+        }
     }
 
     #[test]

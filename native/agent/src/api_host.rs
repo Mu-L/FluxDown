@@ -130,7 +130,7 @@ impl ApiHost for AgentApiHost {
 
     async fn submit_external(&self, request: DownloadRequest) -> Result<(), ApiError> {
         self.capture
-            .submit(request, false)
+            .submit(request, crate::capture::CaptureOrigin::External)
             .await
             .map(|_| ())
             .map_err(|error| ApiError::Internal(error.to_string()))

@@ -2926,6 +2926,7 @@ dependencies = [
  "mdns-sd",
  "notify-rust",
  "rand 0.9.2",
+ "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3217,6 +3218,7 @@ dependencies = [
 name = "fluxdown_ui_settings"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "fluxdown_protocol",
  "fluxdown_ui_components",
  "fluxdown_ui_i18n",
