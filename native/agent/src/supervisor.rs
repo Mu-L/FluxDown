@@ -48,11 +48,17 @@ impl DaemonSupervisor {
     }
 
     /// 启动同级 daemon；短时间内并发/重复调用只产生一个子进程。
-    pub async fn ensure_running(&self) -> Result<(), SupervisorError> {
+    ///
+    /// 返回本进程所监管、仍存活的 daemon 子进程代际（刚拉起或早先拉起）；已停止监管时为
+    /// `None`。代际让调用方区分「同一个子进程仍在初始化」与「子进程已退出又被重新拉起」。
+    pub async fn ensure_running(&self) -> Result<Option<u64>, SupervisorError> {
         let mut state = self.state.lock().await;
         state.reapers.retain(|task| !task.is_finished());
-        if state.running || self.stopped.load(Ordering::Acquire) {
-            return Ok(());
+        if self.stopped.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if state.running {
+            return Ok(Some(state.generation));
         }
         let executable = daemon_executable()?;
         let mut command = std::process::Command::new(&executable);
@@ -79,7 +85,7 @@ impl DaemonSupervisor {
                 state.running = false;
             }
         }));
-        Ok(())
+        Ok(Some(generation))
     }
 }
 

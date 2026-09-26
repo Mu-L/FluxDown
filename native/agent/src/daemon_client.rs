@@ -161,6 +161,12 @@ impl DaemonClient {
     }
 }
 
+/// 本进程刚拉起、仍存活但尚未监听的 daemon 按短间隔轮询（约 10s）：冷启动 daemon 通常
+/// 数百毫秒内就绪，若按 1s 起步的退避等待，整条启动链（界面首个快照）会被白白拖长约 1s。
+/// 只对同一个子进程代际生效；子进程退出后被重新拉起则回到指数退避，避免崩溃循环高频拉起。
+const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STARTUP_POLL_ATTEMPTS: usize = 200;
+
 async fn run_client(
     config: DaemonClientConfig,
     supervisor: Arc<DaemonSupervisor>,
@@ -171,12 +177,17 @@ async fn run_client(
 ) {
     let backoff = [1_u64, 2, 5, 15, 30];
     let mut attempt = 0_usize;
+    // 本轮断连中快速轮询的 daemon 子进程代际与已用次数；连上即清零。
+    let mut polled_child: Option<u64> = None;
+    let mut startup_polls = 0_usize;
     // 每个 agent 进程只尝试替换一次协议不兼容的 daemon，避免同目录二进制错配时反复互杀。
     let mut replaced_incompatible = false;
     loop {
         match connect(&config).await {
             Ok((socket, snapshot, buffered)) => {
                 attempt = 0;
+                polled_child = None;
+                startup_polls = 0;
                 connected.store(true, Ordering::Release);
                 ready.notify_waiters();
                 let snapshot_cursor = (snapshot.epoch.clone(), snapshot.sequence);
@@ -197,11 +208,20 @@ async fn run_client(
                 connected.store(false, Ordering::Release);
                 fail_queued_commands(&mut commands);
             }
-            Err(ConnectError::Refused) => {
-                if let Err(error) = supervisor.ensure_running().await {
+            Err(ConnectError::Refused) => match supervisor.ensure_running().await {
+                Ok(Some(child))
+                    if startup_polls < STARTUP_POLL_ATTEMPTS
+                        && *polled_child.get_or_insert(child) == child =>
+                {
+                    startup_polls += 1;
+                    tokio::time::sleep(STARTUP_POLL_INTERVAL).await;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
                     tracing::warn!(error = %error, "could not supervise fluxdownd");
                 }
-            }
+            },
             Err(ConnectError::Incompatible) if !replaced_incompatible => {
                 replaced_incompatible = true;
                 match request_shutdown(&config).await {
