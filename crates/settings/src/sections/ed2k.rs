@@ -3,7 +3,10 @@
 use fluxdown_ui_components::FluxIcon;
 use gpui::App;
 
-use super::{SectionContext, subscription};
+use super::{
+    SectionContext,
+    subscription::{self, ListFormat},
+};
 use crate::ui::{SettingsPage, SettingsSection, SettingsTab};
 
 pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingsPage {
@@ -38,6 +41,7 @@ fn basic_section(ctx: &SectionContext) -> SettingsSection {
 }
 
 fn servers_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
+    let sub_enabled = ctx.store.read(cx).daemon_bool("ed2k_server_sub_enabled");
     SettingsSection::new()
         .title(ctx.t("settingsTabServers"))
         .row(subscription::list_item(
@@ -46,19 +50,24 @@ fn servers_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
             "ed2kServerListDesc",
             "ed2kServerPlaceholder",
             "ed2k_server_list",
+            ListFormat::Comma,
         ))
         .row(ctx.item(
             "ed2kServerSub",
             Some("ed2kServerSubDesc"),
             ctx.daemon_switch("ed2k_server_sub_enabled"),
         ))
-        .row(subscription::list_item(
-            ctx,
-            "ed2kServerSub",
-            "ed2kServerSubDesc",
-            "ed2kServerSubPlaceholder",
-            "ed2k_server_sub_urls",
-        ))
+        .row(
+            subscription::list_item(
+                ctx,
+                "ed2kServerSubUrls",
+                "ed2kServerSubUrlsDesc",
+                "ed2kServerSubPlaceholder",
+                "ed2k_server_sub_urls",
+                ListFormat::Lines,
+            )
+            .disabled(!sub_enabled),
+        )
         .row(subscription::status_item(
             ctx,
             subscription::SubscriptionKind::Ed2kServers,

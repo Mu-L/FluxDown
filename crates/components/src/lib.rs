@@ -14,12 +14,14 @@ pub use kit::{
 };
 
 use fluxdown_ui_theme::{CONTROL_HEIGHT, active_theme};
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, Div, ElementId, FontFeatures, FontWeight, Hsla, InteractiveElement, IntoElement,
     ParentElement, Pixels, SharedString, StatefulInteractiveElement as _, Styled, div, px,
     relative,
 };
 pub use gpui_base::Button;
+use gpui_component::Sizable as _;
 
 /// 侧栏导航行高。
 pub const NAV_ROW_HEIGHT: Pixels = px(28.);
@@ -48,8 +50,37 @@ pub fn button(
     variant: ButtonVariant,
     cx: &App,
 ) -> Button {
-    let tokens = active_theme(cx).tokens();
     let label = label.into();
+    text_button_frame(id, variant, cx)
+        .accessibility_label(label.clone())
+        .child(label)
+}
+
+/// 触发异步动作（刷新、检测、测试等）的文字按钮：`loading` 时标签前显示旋转图标并置为不可点击，
+/// 视觉只轻微淡出（0.8）而不是禁用态的 0.5，表达「进行中」而非「不可用」。
+///
+/// 本函数已按 `loading` 设置禁用；调用方若再调用 `.disabled(..)`，必须把 `loading` 并入条件。
+pub fn loading_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    variant: ButtonVariant,
+    loading: bool,
+    cx: &App,
+) -> Button {
+    let theme = active_theme(cx);
+    let tokens = theme.tokens();
+    let spinner_size = theme.extended().icon.sm;
+    let label = label.into();
+    with_loading_state(text_button_frame(id, variant, cx), loading)
+        .gap(tokens.spacing.xs + tokens.spacing.xxs)
+        .accessibility_label(label.clone())
+        .when(loading, |this| this.child(spinner(spinner_size)))
+        .child(label)
+}
+
+/// 文字按钮的公共外观（不含内容），供 [`button`] / [`loading_button`] 共用。
+fn text_button_frame(id: impl Into<ElementId>, variant: ButtonVariant, cx: &App) -> Button {
+    let tokens = active_theme(cx).tokens();
     let palette = ButtonPalette::for_variant(variant, tokens.colors);
 
     Button::new(id)
@@ -71,8 +102,22 @@ pub fn button(
         .active(move |style| style.bg(palette.active))
         .focus_visible(move |style| style.border_color(tokens.colors.ring))
         .styles(|styles| styles.disabled(|style| style.opacity(0.5)))
-        .accessibility_label(label.clone())
-        .child(label)
+}
+
+/// 进行中：不可点击，但只淡出到 0.8，与普通禁用区分。
+fn with_loading_state(button: Button, loading: bool) -> Button {
+    if loading {
+        button
+            .disabled(true)
+            .styles(|styles| styles.disabled(|style| style.opacity(0.8)))
+    } else {
+        button
+    }
+}
+
+/// 按钮内的旋转加载图标；颜色继承按钮文字色（危险按钮等自定义前景色同样适用）。
+fn spinner(size: Pixels) -> gpui_component::spinner::Spinner {
+    gpui_component::spinner::Spinner::new().with_size(gpui_component::Size::Size(size))
 }
 
 /// 单选「选项片」：一组互斥预设中的一项（如 Webhook 模板预设）。未选中为次要按钮外观，
@@ -141,6 +186,34 @@ pub fn icon_button(
     variant: ButtonVariant,
     cx: &App,
 ) -> Button {
+    icon_button_frame(id, label, variant, cx).child(icon)
+}
+
+/// [`icon_button`] 的 loading 版本：`loading` 时以旋转图标替换原图标并置为不可点击
+/// （0.8 淡出）。调用方若再调用 `.disabled(..)`，必须把 `loading` 并入条件。
+pub fn loading_icon_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    icon: impl IntoElement,
+    variant: ButtonVariant,
+    loading: bool,
+    cx: &App,
+) -> Button {
+    let spinner_size = active_theme(cx).extended().icon.md;
+    let button = with_loading_state(icon_button_frame(id, label, variant, cx), loading);
+    if loading {
+        button.child(spinner(spinner_size))
+    } else {
+        button.child(icon)
+    }
+}
+
+fn icon_button_frame(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    variant: ButtonVariant,
+    cx: &App,
+) -> Button {
     let tokens = active_theme(cx).tokens();
     let palette = ButtonPalette::for_variant(variant, tokens.colors);
 
@@ -160,7 +233,6 @@ pub fn icon_button(
         .focus_visible(move |style| style.border_color(tokens.colors.ring))
         .styles(|styles| styles.disabled(|style| style.opacity(0.5)))
         .accessibility_label(label)
-        .child(icon)
 }
 /// 创建带前置图标的主要操作按钮。
 pub fn primary_icon_button(

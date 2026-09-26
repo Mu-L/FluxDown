@@ -1,7 +1,7 @@
 //! Webhook：端点列表（daemon `webhook.endpoints` JSON）与投递记录。
 
 use fluxdown_protocol::method;
-use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, tabular_numbers};
+use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, loading_button, tabular_numbers};
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     App, Context, InteractiveElement as _, IntoElement as _, ParentElement, SharedString, Styled,
@@ -15,6 +15,7 @@ use super::{SectionContext, webhook_dialog};
 use crate::store::SettingsStore;
 use crate::ui::{
     SettingsRow, SettingsSection, body_text, empty_state, meta_text, row_button, row_danger_button,
+    row_loading_button,
 };
 
 pub(crate) const ENDPOINTS_KEY: &str = "webhook.endpoints";
@@ -197,10 +198,11 @@ fn endpoints_item(ctx: &SectionContext) -> SettingsRow {
                         }),
                     )
                     .child(
-                        row_button(
+                        row_loading_button(
                             SharedString::from(format!("webhook-test-{}", endpoint.id)),
                             test.clone(),
                             ButtonVariant::Secondary,
+                            store.read(cx).is_busy_tagged("webhookTest", &endpoint.id),
                             cx,
                         )
                         .disabled(disabled || store.read(cx).is_busy("webhookTest"))
@@ -262,6 +264,7 @@ fn endpoints_item(ctx: &SectionContext) -> SettingsRow {
                                             );
                                         },
                                     );
+                                    store.tag_busy("webhookTest", test_endpoint.id.clone());
                                 });
                             }
                         }),
@@ -395,7 +398,7 @@ pub(crate) fn delivery_log_group(ctx: &SectionContext, _cx: &mut App) -> Setting
                     .justify_end()
                     .gap(tokens.spacing.sm)
                     .child(
-                        button(
+                        loading_button(
                             "webhook-simulate",
                             if store.read(cx).is_busy("webhookSimulate") {
                                 SharedString::from(translator.text("webhookLogPending").to_owned())
@@ -403,6 +406,7 @@ pub(crate) fn delivery_log_group(ctx: &SectionContext, _cx: &mut App) -> Setting
                                 simulate.clone()
                             },
                             ButtonVariant::Secondary,
+                            simulate_store.read(cx).is_busy("webhookSimulate"),
                             cx,
                         )
                         .disabled(disabled || simulate_store.read(cx).is_busy("webhookSimulate"))

@@ -1,12 +1,12 @@
 //! 已保存的站点 HTTP Basic 凭据管理（只列站点与用户名，可逐条删除或清空）。
 
-use fluxdown_ui_components::{ButtonVariant, button};
+use fluxdown_ui_components::{ButtonVariant, loading_button};
 use fluxdown_ui_theme::active_theme;
 use gpui::{App, IntoElement as _, ParentElement, SharedString, Styled};
 use gpui_component::{h_flex, v_flex};
 
 use super::SectionContext;
-use crate::ui::{SettingsRow, SettingsSection, body_text, meta_text, row_danger_button};
+use crate::ui::{SettingsRow, SettingsSection, body_text, meta_text, row_loading_danger_button};
 
 pub(crate) fn group(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
     if ctx.store.read(cx).site_auth().is_empty()
@@ -34,6 +34,7 @@ fn list_item(ctx: &SectionContext) -> SettingsRow {
         let extended = theme.extended().colors;
         let entries = store.read(cx).site_auth().to_vec();
         let busy = store.read(cx).is_busy("siteAuth");
+        let clearing = store.read(cx).is_busy_tagged("siteAuth", "clearAll");
         let clear_store = store.clone();
         let mut column = v_flex().w_full().gap(tokens.spacing.xs);
         if entries.is_empty() {
@@ -42,6 +43,7 @@ fn list_item(ctx: &SectionContext) -> SettingsRow {
         for entry in entries {
             let site = entry.site.clone();
             let delete_store = store.clone();
+            let deleting = store.read(cx).is_busy_tagged("siteAuth", &site);
             column = column.child(
                 h_flex()
                     .w_full()
@@ -58,15 +60,19 @@ fn list_item(ctx: &SectionContext) -> SettingsRow {
                             .child(meta_text(cx).child(SharedString::from(entry.user.clone()))),
                     )
                     .child(
-                        row_danger_button(
+                        row_loading_danger_button(
                             SharedString::from(format!("site-auth-delete-{}", entry.site)),
                             delete.clone(),
+                            deleting,
                             cx,
                         )
                         .disabled(busy)
                         .on_click(move |_, _, cx| {
                             let site = site.clone();
-                            delete_store.update(cx, |store, cx| store.delete_site_auth(&site, cx));
+                            delete_store.update(cx, |store, cx| {
+                                store.delete_site_auth(&site, cx);
+                                store.tag_busy("siteAuth", site);
+                            });
                         }),
                     ),
             );
@@ -74,15 +80,19 @@ fn list_item(ctx: &SectionContext) -> SettingsRow {
         column
             .child(
                 h_flex().w_full().justify_end().child(
-                    button(
+                    loading_button(
                         "site-auth-clear",
                         clear_all.clone(),
                         ButtonVariant::Secondary,
+                        clearing,
                         cx,
                     )
                     .disabled(busy || store.read(cx).site_auth().is_empty())
                     .on_click(move |_, _, cx| {
-                        clear_store.update(cx, |store, cx| store.clear_site_auth(cx));
+                        clear_store.update(cx, |store, cx| {
+                            store.clear_site_auth(cx);
+                            store.tag_busy("siteAuth", "clearAll");
+                        });
                     }),
                 ),
             )

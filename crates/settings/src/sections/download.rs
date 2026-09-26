@@ -1,6 +1,6 @@
 //! 下载：保存位置、行为、连接与性能、自动重试、高级。
 
-use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, tabular_numbers};
+use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, loading_button, tabular_numbers};
 use fluxdown_ui_theme::active_theme;
 use gpui::{App, ParentElement, SharedString, Styled, px};
 use gpui_component::h_flex;
@@ -112,7 +112,7 @@ fn behavior_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
         section = section.row(ctx.item(
             "silentSkipSelection",
             Some("silentSkipSelectionDesc"),
-            ctx.pref_switch("silent_skip_selection", false),
+            ctx.pref_switch("download.silent_skip_selection", false),
         ));
     }
     section
@@ -230,6 +230,7 @@ fn conn_policy_control(ctx: &SectionContext) -> Control {
             .conn_policy()
             .map_or(0, |summary| summary.domain_count);
         let busy = store.read(cx).is_busy("connPolicy");
+        let clearing = store.read(cx).is_busy_tagged("connPolicy", "clear");
         let clear_store = store.clone();
         h_flex()
             .gap(tokens.spacing.sm)
@@ -244,15 +245,19 @@ fn conn_policy_control(ctx: &SectionContext) -> Control {
                     }),
             )
             .child(
-                button(
+                loading_button(
                     "download-clear-conn-policy",
                     clear.clone(),
                     ButtonVariant::Secondary,
+                    clearing,
                     cx,
                 )
                 .disabled(busy || count == 0)
                 .on_click(move |_, _, cx| {
-                    clear_store.update(cx, |store, cx| store.clear_conn_policy(cx));
+                    clear_store.update(cx, |store, cx| {
+                        store.clear_conn_policy(cx);
+                        store.tag_busy("connPolicy", "clear");
+                    });
                 }),
             )
     })

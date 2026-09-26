@@ -1,7 +1,7 @@
 //! 关于：版本、软件更新、日志导出、浏览器扩展与捐赠链接。
 
 use fluxdown_protocol::method;
-use fluxdown_ui_components::{ButtonVariant, FluxIcon, button};
+use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, loading_button};
 use fluxdown_ui_theme::active_theme;
 use gpui::{App, IntoElement as _, ParentElement, SharedString, Styled, div};
 use gpui_component::{h_flex, v_flex};
@@ -117,10 +117,11 @@ fn check_update_control(ctx: &SectionContext) -> Control {
                 .on_click(move |_, _, cx| cx.open_url(&url))
             }))
             .child(
-                button(
+                loading_button(
                     "about-check-update",
                     check.clone(),
                     ButtonVariant::Secondary,
+                    busy,
                     cx,
                 )
                 .disabled(disabled || busy)
@@ -179,18 +180,21 @@ fn export_control(ctx: &SectionContext) -> Control {
     Control::custom(move |disabled, _key, _window, cx: &mut App| {
         let tokens = active_theme(cx).tokens();
         let busy = store.read(cx).is_busy("logExport");
+        let opening = store.read(cx).is_busy_tagged("logExport", "openLogDir");
+        let exporting = store.read(cx).is_busy_tagged("logExport", "exportLogs");
         let export_store = store.clone();
         let open_store = store.clone();
         h_flex()
             .gap(tokens.spacing.sm)
             .child(
-                button(
+                loading_button(
                     "about-open-log-dir",
                     open.clone(),
                     ButtonVariant::Secondary,
+                    opening,
                     cx,
                 )
-                .disabled(disabled)
+                .disabled(disabled || opening)
                 .on_click(move |_, _, cx| {
                     open_store.update(cx, |store, cx| {
                         store.call_with(
@@ -212,17 +216,20 @@ fn export_control(ctx: &SectionContext) -> Control {
                                         None,
                                         cx,
                                     );
+                                    store.tag_busy("logExport", "openLogDir");
                                 }
                             },
                         );
+                        store.tag_busy("logExport", "openLogDir");
                     });
                 }),
             )
             .child(
-                button(
+                loading_button(
                     "about-export-logs",
                     export.clone(),
                     ButtonVariant::Primary,
+                    exporting,
                     cx,
                 )
                 .disabled(disabled || busy)
@@ -241,6 +248,7 @@ fn export_control(ctx: &SectionContext) -> Control {
                                     Some("logExportSuccessNotice"),
                                     cx,
                                 );
+                                store.tag_busy("logExport", "exportLogs");
                             });
                         }
                     })

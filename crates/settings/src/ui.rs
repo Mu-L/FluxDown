@@ -142,6 +142,30 @@ pub(crate) fn row_danger_button(
     danger_ghost_button(id, label, cx).flex_shrink_0()
 }
 
+/// [`row_button`] 的 loading 版本（异步动作进行中显示旋转图标且不可点击）。
+pub(crate) fn row_loading_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    variant: ButtonVariant,
+    loading: bool,
+    cx: &App,
+) -> fluxdown_ui_components::Button {
+    fluxdown_ui_components::loading_button(id, label, variant, loading, cx).flex_shrink_0()
+}
+
+/// [`row_danger_button`] 的 loading 版本。
+pub(crate) fn row_loading_danger_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    loading: bool,
+    cx: &App,
+) -> fluxdown_ui_components::Button {
+    let destructive = active_theme(cx).tokens().colors.destructive;
+    fluxdown_ui_components::loading_button(id, label, ButtonVariant::Ghost, loading, cx)
+        .text_color(destructive)
+        .flex_shrink_0()
+}
+
 /// 列表行内的纯图标按钮（上移 / 下移等）：套件图标按钮，不被长文本挤压。
 /// 返回值已设置悬停，调用方不得再 `.hover()`。
 pub(crate) fn row_icon_button(

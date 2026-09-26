@@ -1,7 +1,7 @@
 //! 代理：模式、手动服务器、连通性测试、站点凭据。
 
 use fluxdown_protocol::method;
-use fluxdown_ui_components::{ButtonVariant, FluxIcon, button};
+use fluxdown_ui_components::{ButtonVariant, FluxIcon, loading_button};
 use fluxdown_ui_theme::active_theme;
 use gpui::{App, ParentElement, SharedString, Styled};
 use gpui_component::{Icon, h_flex};
@@ -242,10 +242,11 @@ fn test_control(ctx: &SectionContext, source: ProxyTestSource) -> Control {
             .items_center()
             .child(meta_text(cx).child(SharedString::from(result.unwrap_or_default())))
             .child(
-                button(
+                loading_button(
                     "proxy-test",
                     if busy { testing.clone() } else { label.clone() },
                     ButtonVariant::Secondary,
+                    busy,
                     cx,
                 )
                 .disabled(busy)

@@ -1,7 +1,10 @@
 //! 多行列表编辑（Tracker / 服务器 / 订阅源）与订阅状态行。
 
+use std::collections::HashSet;
+
+use chrono::{Local, TimeZone as _};
 use fluxdown_protocol::method;
-use fluxdown_ui_components::{ButtonVariant, button};
+use fluxdown_ui_components::{ButtonVariant, loading_button};
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     App, AppContext as _, Entity, IntoElement as _, ParentElement, SharedString, Styled,
@@ -18,32 +21,87 @@ use super::SectionContext;
 use crate::store::SettingsStore;
 use crate::ui::{Control, SettingsRow, body_text, meta_text};
 
+/// 列表型配置键的存储格式；编辑区一律每行一个条目。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListFormat {
+    /// 按行存储（Tracker、订阅地址；保留 `#` 注释等自由文本）。
+    Lines,
+    /// 逗号分隔的 `host:port`（`ed2k_server_list` / `ed2k_server_sub_cache`）。
+    /// 读取时同时容忍换行/空白分隔的旧值。
+    Comma,
+}
+
+impl ListFormat {
+    /// 存储值中的非空条目。
+    fn entries(self, stored: &str) -> impl Iterator<Item = &str> {
+        let is_separator: fn(char) -> bool = match self {
+            Self::Lines => |c| c == '\n' || c == '\r',
+            Self::Comma => |c| c == ',' || c.is_whitespace(),
+        };
+        stored
+            .split(is_separator)
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+    }
+
+    /// 存储值中的条目数。
+    pub(crate) fn count(self, stored: &str) -> usize {
+        self.entries(stored).count()
+    }
+
+    /// 存储值 → 编辑区文本（每行一个）。
+    fn to_editor(self, stored: &str) -> String {
+        match self {
+            Self::Lines => stored.to_owned(),
+            Self::Comma => self.entries(stored).collect::<Vec<_>>().join("\n"),
+        }
+    }
+
+    /// 编辑区文本 → 存储值；与 daemon 的文本规范化（首尾去空白）结果一致，
+    /// 使回显值可直接与上次写入值比较。
+    fn to_stored(self, text: &str) -> String {
+        match self {
+            Self::Lines => text.trim().to_owned(),
+            Self::Comma => {
+                let mut seen = HashSet::new();
+                self.entries(text)
+                    .filter(|entry| seen.insert(entry.to_ascii_lowercase()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        }
+    }
+}
+
 struct TextareaSlot {
     state: Entity<TextareaState>,
-    last_synced: SharedString,
+    /// 最近一次与存储同步的值（存储格式）。
+    last_synced: String,
     _subscription: Subscription,
 }
 
-/// 多行文本编辑一个 daemon 文本键；每行一个条目，失焦或改动即写回。
+/// 多行文本编辑一个 daemon 列表键；编辑区每行一个条目，改动或失焦即按 `format` 写回。
 pub(crate) fn list_item(
     ctx: &SectionContext,
     title_key: &str,
     desc_key: &str,
     placeholder_key: &str,
     key: &'static str,
+    format: ListFormat,
 ) -> SettingsRow {
-    let field = textarea_field(ctx.store(), ctx.t(placeholder_key), key);
+    let field = textarea_field(ctx.store(), ctx.t(placeholder_key), key, format);
     ctx.item(title_key, Some(desc_key), field).vertical()
 }
 
-pub(crate) fn textarea_field(
+fn textarea_field(
     store: Entity<SettingsStore>,
     placeholder: SharedString,
     key: &'static str,
+    format: ListFormat,
 ) -> Control {
     Control::custom(
         move |disabled, row_key: &SharedString, window: &mut Window, cx: &mut App| {
-            let current = SharedString::from(store.read(cx).daemon_str(key));
+            let current = store.read(cx).daemon_str(key);
             let slot =
                 window.use_keyed_state(SharedString::from(format!("{row_key}-textarea")), cx, {
                     let store = store.clone();
@@ -52,18 +110,20 @@ pub(crate) fn textarea_field(
                     move |window, cx| {
                         let state = cx.new(|cx| {
                             TextareaState::new(window, cx)
-                                .default_value(current.clone())
+                                .default_value(format.to_editor(&current))
                                 .placeholder(placeholder)
                         });
                         let _subscription = cx.subscribe(
                             &state,
                             move |slot: &mut TextareaSlot, state, event: &InputEvent, cx| {
                                 if matches!(event, InputEvent::Change | InputEvent::Blur) {
-                                    let value = state.read(cx).value();
-                                    if value != slot.last_synced {
-                                        slot.last_synced = value.clone();
+                                    // 按存储格式比较：编辑中的尾随换行、重复项等
+                                    // 不改变存储值，既不写回也不触发回显覆盖光标。
+                                    let stored = format.to_stored(&state.read(cx).value());
+                                    if stored != slot.last_synced {
+                                        slot.last_synced = stored.clone();
                                         store.update(cx, |store, cx| {
-                                            store.set_daemon(key, value.to_string(), cx)
+                                            store.set_daemon(key, stored, cx)
                                         });
                                     }
                                 }
@@ -78,9 +138,10 @@ pub(crate) fn textarea_field(
                 });
             slot.update(cx, |slot, cx| {
                 if slot.last_synced != current {
-                    slot.last_synced = current.clone();
+                    let text = SharedString::from(format.to_editor(&current));
+                    slot.last_synced = current;
                     slot.state
-                        .update(cx, |state, cx| state.set_value(current.clone(), window, cx));
+                        .update(cx, |state, cx| state.set_value(text, window, cx));
                 }
             });
             let state = slot.read(cx).state.clone();
@@ -104,6 +165,13 @@ impl SubscriptionKind {
         match self {
             Self::BtTrackers => "bt_tracker_sub_cache",
             Self::Ed2kServers => "ed2k_server_sub_cache",
+        }
+    }
+    /// 订阅缓存的存储格式（与宿主写缓存时的拼接符一致）。
+    fn cache_format(self) -> ListFormat {
+        match self {
+            Self::BtTrackers => ListFormat::Lines,
+            Self::Ed2kServers => ListFormat::Comma,
         }
     }
     fn updated_at_key(self) -> &'static str {
@@ -148,11 +216,9 @@ pub(crate) fn status_item(
     SettingsRow::custom(move |_, _, _, cx: &mut App| {
         let tokens = active_theme(cx).tokens();
         let snapshot = store.read(cx);
-        let count = snapshot
-            .daemon_str(kind.cache_key())
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count();
+        let count = kind
+            .cache_format()
+            .count(&snapshot.daemon_str(kind.cache_key()));
         let updated_at = snapshot.daemon_i64(kind.updated_at_key());
         let busy = snapshot.is_busy(kind.action());
         let last_failed = snapshot
@@ -193,7 +259,7 @@ pub(crate) fn status_item(
                     ),
             )
             .child(
-                button(
+                loading_button(
                     kind.action(),
                     if busy {
                         updating.clone()
@@ -201,6 +267,7 @@ pub(crate) fn status_item(
                         update_now.clone()
                     },
                     ButtonVariant::Secondary,
+                    busy,
                     cx,
                 )
                 .disabled(busy)
@@ -228,21 +295,68 @@ pub(crate) fn status_item(
     })
 }
 
-/// Unix 秒 → 本地时间 `YYYY-MM-DD HH:MM`（无时区库，按 UTC 偏移 0 计算）。
+/// Unix 秒 → 本地时间 `YYYY-MM-DD HH:MM`。
 pub(crate) fn format_unix(secs: i64) -> String {
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let (hour, minute) = (rem / 3600, (rem % 3600) / 60);
-    // 民用日历转换（Howard Hinnant 算法）
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}")
+    Local
+        .timestamp_opt(secs, 0)
+        .single()
+        .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ListFormat;
+
+    #[test]
+    fn comma_list_is_edited_one_per_line() {
+        let stored = "176.123.5.89:4725,45.82.80.155:5687, 85.121.5.137:4232";
+        assert_eq!(
+            ListFormat::Comma.to_editor(stored),
+            "176.123.5.89:4725\n45.82.80.155:5687\n85.121.5.137:4232"
+        );
+    }
+
+    #[test]
+    fn comma_list_reads_legacy_line_separated_value() {
+        let legacy = "1.2.3.4:4661\r\n5.6.7.8:80\n";
+        assert_eq!(
+            ListFormat::Comma.to_editor(legacy),
+            "1.2.3.4:4661\n5.6.7.8:80"
+        );
+        assert_eq!(ListFormat::Comma.count(legacy), 2);
+    }
+
+    #[test]
+    fn comma_list_saves_trimmed_deduped_csv() {
+        let text = " 1.2.3.4:4661 \n\nExample.org:4242\n1.2.3.4:4661\nexample.org:4242\n";
+        assert_eq!(
+            ListFormat::Comma.to_stored(text),
+            "1.2.3.4:4661,Example.org:4242"
+        );
+    }
+
+    #[test]
+    fn trailing_newline_does_not_change_stored_value() {
+        for format in [ListFormat::Lines, ListFormat::Comma] {
+            assert_eq!(format.to_stored("a:1\n"), format.to_stored("a:1"));
+        }
+    }
+
+    #[test]
+    fn cache_counts_follow_storage_separator() {
+        assert_eq!(ListFormat::Comma.count("1.1.1.1:1,2.2.2.2:2,3.3.3.3:3"), 3);
+        assert_eq!(ListFormat::Lines.count("udp://a:1\n\nudp://b:2\n"), 2);
+        assert_eq!(ListFormat::Comma.count(""), 0);
+    }
+
+    #[test]
+    fn lines_format_keeps_inner_text_verbatim() {
+        let text = "# comment\nhttps://a.example/list.txt\n";
+        assert_eq!(
+            ListFormat::Lines.to_stored(text),
+            "# comment\nhttps://a.example/list.txt"
+        );
+        assert_eq!(ListFormat::Lines.to_editor(text), text);
+    }
 }

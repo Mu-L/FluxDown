@@ -1,7 +1,7 @@
 //! Doctor：环境自检报告与就地修复。检查项 `id`/`hint`/`repair.action` 由 agent 给出。
 
 use fluxdown_protocol::{DiagnosticLevel, DiagnosticRepairParams, method};
-use fluxdown_ui_components::{ButtonVariant, FluxIcon, button};
+use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, loading_button};
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     App, ClipboardItem, FontWeight, IntoElement as _, ParentElement, SharedString, Styled, div, px,
@@ -10,7 +10,9 @@ use gpui_component::{h_flex, v_flex};
 use serde_json::json;
 
 use super::{SectionContext, camel};
-use crate::ui::{SettingsPage, SettingsRow, SettingsSection, body_text, meta_text, row_button};
+use crate::ui::{
+    SettingsPage, SettingsRow, SettingsSection, body_text, meta_text, row_loading_button,
+};
 
 pub(crate) fn page(ctx: &SectionContext, _cx: &mut App) -> SettingsPage {
     SettingsPage::new(
@@ -36,6 +38,8 @@ fn toolbar_item(ctx: &SectionContext) -> SettingsRow {
     SettingsRow::custom(move |disabled, _key, _window, cx: &mut App| {
         let tokens = active_theme(cx).tokens();
         let busy = store.read(cx).is_busy("diagnostics");
+        // 修复动作同样占用 `diagnostics`，只有「运行检测」本身才让该按钮转圈。
+        let running_check = store.read(cx).is_busy_untagged("diagnostics");
         let report = store.read(cx).diagnostics().cloned();
         let summary = report.as_ref().map_or_else(
             || never.to_string(),
@@ -82,10 +86,15 @@ fn toolbar_item(ctx: &SectionContext) -> SettingsRow {
                             }),
                     )
                     .child(
-                        button(
+                        loading_button(
                             "doctor-run",
-                            if busy { running.clone() } else { run.clone() },
+                            if running_check {
+                                running.clone()
+                            } else {
+                                run.clone()
+                            },
                             ButtonVariant::Primary,
+                            running_check,
                             cx,
                         )
                         .disabled(disabled || busy)
@@ -170,17 +179,24 @@ fn report_item(ctx: &SectionContext) -> SettingsRow {
                 let label = SharedString::from(translator.text(&action_key).to_owned());
                 let repair_store = store.clone();
                 let params = repair.clone();
+                let tag = SharedString::from(format!("{}-{}", check.id, check.target));
+                let repairing = store.read(cx).is_busy_tagged("diagnostics", &tag);
                 row = row.child(
-                    row_button(
-                        SharedString::from(format!("doctor-repair-{}-{}", check.id, check.target)),
+                    row_loading_button(
+                        SharedString::from(format!("doctor-repair-{tag}")),
                         label,
                         ButtonVariant::Secondary,
+                        repairing,
                         cx,
                     )
                     .disabled(disabled || busy)
                     .on_click(move |_, _, cx| {
                         let params = params.clone();
-                        repair_store.update(cx, |store, cx| run_repair(store, params, cx));
+                        let tag = tag.clone();
+                        repair_store.update(cx, |store, cx| {
+                            run_repair(store, params, cx);
+                            store.tag_busy("diagnostics", tag);
+                        });
                     }),
                 );
             }

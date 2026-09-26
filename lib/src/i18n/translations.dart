@@ -162,6 +162,8 @@ class S {
   String get queueScheduleStopLabel => _r('queueScheduleStopLabel');
   String get queueScheduleTimeHint => _r('queueScheduleTimeHint');
   String get queueScheduleTimeInvalid => _r('queueScheduleTimeInvalid');
+  String get queueScheduleTimeUnset => _r('queueScheduleTimeUnset');
+  String get queueScheduleTimePickHint => _r('queueScheduleTimePickHint');
   String get queueScheduleDays => _r('queueScheduleDays');
   String get weekdaysShort => _r('weekdaysShort');
   String get queueTasksOrderHint => _r('queueTasksOrderHint');
@@ -1414,6 +1416,8 @@ class S {
   String get btTrackerSubUpdateFailed => _r('btTrackerSubUpdateFailed');
   String get btTrackerSubPlaceholder => _r('btTrackerSubPlaceholder');
   String get btTrackerSubResetConfirm => _r('btTrackerSubResetConfirm');
+  String get btTrackerSubUrls => _r('btTrackerSubUrls');
+  String get btTrackerSubUrlsDesc => _r('btTrackerSubUrlsDesc');
   String get btPortInvalid => _r('btPortInvalid');
 
   // ─────────────────────────────────────────────
@@ -1499,6 +1503,8 @@ class S {
   String get ed2kServerSubUpdateFailed => _r('ed2kServerSubUpdateFailed');
   String get ed2kServerSubPlaceholder => _r('ed2kServerSubPlaceholder');
   String get ed2kServerSubResetConfirm => _r('ed2kServerSubResetConfirm');
+  String get ed2kServerSubUrls => _r('ed2kServerSubUrls');
+  String get ed2kServerSubUrlsDesc => _r('ed2kServerSubUrlsDesc');
 
   // ─────────────────────────────────────────────
   // File picker 错误

@@ -2,7 +2,8 @@
 
 use fluxdown_protocol::GatewayPatchParams;
 use fluxdown_ui_components::{
-    ButtonVariant, ControlExt as _, FluxIcon, button, icon_button, tabular_numbers,
+    ButtonVariant, ControlExt as _, FluxIcon, button, icon_button, loading_icon_button,
+    tabular_numbers,
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -183,13 +184,15 @@ fn token_field(ctx: &SectionContext) -> Control {
             .and_then(serde_json::Value::as_str)
             .map(|token| SharedString::from(token.to_owned()))
             .unwrap_or_default();
-        let revealed = snapshot.transient("gateway_user_token").is_some();
+        let needs_reveal = snapshot.gateway_token_needs_reveal();
         let busy = snapshot.is_busy("gateway") || snapshot.is_busy("gatewayToken");
+        let regenerating = snapshot.is_busy_tagged("gateway", "regenerateToken");
+        let clearing = snapshot.is_busy_tagged("gateway", "clearToken");
         let just_copied = snapshot
             .transient("gateway_token_copied")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        if !revealed && !busy {
+        if needs_reveal && !busy {
             store.update(cx, |store, cx| store.reveal_gateway_token(cx));
         }
 
@@ -294,11 +297,12 @@ fn token_field(ctx: &SectionContext) -> Control {
                 }),
             )
             .child(
-                icon_button(
+                loading_icon_button(
                     "api-token-generate",
                     generate.clone(),
                     Icon::new(FluxIcon::RotateCw).size(icon_size),
                     ButtonVariant::Secondary,
+                    regenerating,
                     cx,
                 )
                 .disabled(disabled || busy)
@@ -312,17 +316,19 @@ fn token_field(ctx: &SectionContext) -> Control {
                             },
                             cx,
                         );
+                        store.tag_busy("gateway", "regenerateToken");
                     });
                 }),
             )
             .child(
-                icon_button(
+                loading_icon_button(
                     "api-token-clear",
                     clear.clone(),
                     Icon::new(FluxIcon::Trash2)
                         .size(icon_size)
                         .text_color(tokens.colors.destructive),
                     ButtonVariant::Secondary,
+                    clearing,
                     cx,
                 )
                 .disabled(disabled || busy || token.is_empty())
@@ -336,6 +342,7 @@ fn token_field(ctx: &SectionContext) -> Control {
                             },
                             cx,
                         );
+                        store.tag_busy("gateway", "clearToken");
                     });
                 }),
             )

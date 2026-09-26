@@ -13,15 +13,16 @@ use fluxdown_ui_components::{
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    App, AppContext as _, ClickEvent, Context, Div, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled,
-    Window, div, prelude::FluentBuilder as _, px,
+    Anchor, App, AppContext as _, ClickEvent, Context, Div, Entity, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Disableable as _, Icon, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
+    menu::{DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
     switch::Switch,
     tooltip::Tooltip,
@@ -34,10 +35,44 @@ use crate::controller::{DownloadsCommand, DownloadsPort, QueueFields};
 const LIST_WIDTH: gpui::Pixels = px(184.);
 /// 队列运行状态圆点直径。
 const STATUS_DOT_SIZE: gpui::Pixels = px(6.);
+/// 时 / 分下拉菜单最大高度（24 小时项需滚动）。
+const TIME_MENU_MAX_HEIGHT: gpui::Pixels = px(280.);
+/// 分钟下拉的步长。
+const MINUTE_STEP: u16 = 5;
 
 /// 星期位掩码单日切换：`bit_index` 0 = 周一 … 6 = 周日。
 fn toggle_day_bit(days: i32, bit: i32, checked: bool) -> i32 {
     if checked { days | bit } else { days & !bit }
+}
+
+/// 解析 daemon 的 `HH:MM` 为当日分钟数；空串或非法值视为不定时。
+fn parse_time(text: &str) -> Option<u16> {
+    let (hours, minutes) = text.trim().split_once(':')?;
+    let hours: u16 = hours.parse().ok()?;
+    let minutes: u16 = minutes.parse().ok()?;
+    (hours < 24 && minutes < 60).then_some(hours * 60 + minutes)
+}
+
+/// 当日分钟数 → daemon wire `HH:MM`；`None` → 空串（不定时）。
+fn format_time(time: Option<u16>) -> String {
+    time.map(|minutes| format!("{:02}:{:02}", minutes / 60, minutes % 60))
+        .unwrap_or_default()
+}
+
+/// 分钟候选：按步长取整点，外加当前值（旧数据可能不是步长整数倍），升序去重。
+fn minute_choices(current: u16) -> Vec<u16> {
+    let mut choices: Vec<u16> = (0..60).step_by(usize::from(MINUTE_STEP)).collect();
+    if let Err(index) = choices.binary_search(&current) {
+        choices.insert(index, current);
+    }
+    choices
+}
+
+/// 定时字段：启动 / 停止。
+#[derive(Clone, Copy)]
+enum ScheduleSlot {
+    Start,
+    Stop,
 }
 
 /// 一份正在编辑的队列表单；`queue_id = None` 表示「新建」。
@@ -52,8 +87,9 @@ struct QueueForm {
     segments: Entity<InputState>,
     user_agent: Entity<InputState>,
     schedule_enabled: bool,
-    schedule_start: Entity<InputState>,
-    schedule_stop: Entity<InputState>,
+    /// 当日分钟数；`None` = 不定时。
+    schedule_start: Option<u16>,
+    schedule_stop: Option<u16>,
     /// bit0 = 周一 … bit6 = 周日。
     schedule_days: i32,
     picking_dir: bool,
@@ -72,8 +108,8 @@ impl QueueForm {
             segments: cx.new(|cx| InputState::new(window, cx).default_value("0")),
             user_agent: cx.new(|cx| InputState::new(window, cx)),
             schedule_enabled: false,
-            schedule_start: cx.new(|cx| InputState::new(window, cx)),
-            schedule_stop: cx.new(|cx| InputState::new(window, cx)),
+            schedule_start: None,
+            schedule_stop: None,
             schedule_days: 127,
             picking_dir: false,
         }
@@ -107,10 +143,8 @@ impl QueueForm {
                 InputState::new(window, cx).default_value(queue.default_user_agent.clone())
             }),
             schedule_enabled: queue.schedule_enabled,
-            schedule_start: cx
-                .new(|cx| InputState::new(window, cx).default_value(queue.schedule_start.clone())),
-            schedule_stop: cx
-                .new(|cx| InputState::new(window, cx).default_value(queue.schedule_stop.clone())),
+            schedule_start: parse_time(&queue.schedule_start),
+            schedule_stop: parse_time(&queue.schedule_stop),
             schedule_days: queue.schedule_days,
             picking_dir: false,
         }
@@ -122,6 +156,13 @@ impl QueueForm {
             self.queue_id.as_deref(),
             Some(MAIN_QUEUE_ID) | Some(LATER_QUEUE_ID)
         )
+    }
+
+    fn slot_mut(&mut self, slot: ScheduleSlot) -> &mut Option<u16> {
+        match slot {
+            ScheduleSlot::Start => &mut self.schedule_start,
+            ScheduleSlot::Stop => &mut self.schedule_stop,
+        }
     }
 }
 
@@ -266,23 +307,6 @@ impl QueueManagerView {
         input.read(cx).value().trim().parse().unwrap_or(0)
     }
 
-    /// `HH:MM`；空串合法（表示不定时）。
-    fn valid_time(text: &str) -> bool {
-        if text.is_empty() {
-            return true;
-        }
-        let Some((hours, minutes)) = text.split_once(':') else {
-            return false;
-        };
-        let Ok(hours) = hours.parse::<u32>() else {
-            return false;
-        };
-        let Ok(minutes) = minutes.parse::<u32>() else {
-            return false;
-        };
-        hours < 24 && minutes < 60
-    }
-
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = &self.form else { return };
         let name = form.name.read(cx).value().trim().to_owned();
@@ -290,12 +314,8 @@ impl QueueManagerView {
             self.fail("queueNameRequired", cx);
             return;
         }
-        let start = form.schedule_start.read(cx).value().trim().to_owned();
-        let stop = form.schedule_stop.read(cx).value().trim().to_owned();
-        if form.schedule_enabled && (!Self::valid_time(&start) || !Self::valid_time(&stop)) {
-            self.fail("queueScheduleTimeInvalid", cx);
-            return;
-        }
+        let start = format_time(form.schedule_start);
+        let stop = format_time(form.schedule_stop);
         let fields = QueueFields {
             name,
             speed_limit_kbps: Self::parse_int(&form.speed_limit, cx),
@@ -634,6 +654,115 @@ impl QueueManagerView {
         )
     }
 
+    /// 改写某个定时时刻并重绘。
+    fn set_schedule_time(&mut self, slot: ScheduleSlot, time: Option<u16>, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.form {
+            *form.slot_mut(slot) = time;
+        }
+        cx.notify();
+    }
+
+    /// 时间下拉：「时」含「不定时」项，「分」按步长；未定时时「分」禁用。
+    fn render_time_field(
+        &self,
+        slot: ScheduleSlot,
+        time: Option<u16>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let spacing = active_theme(cx).tokens().spacing;
+        let (label_key, hour_id, minute_id) = match slot {
+            ScheduleSlot::Start => (
+                "queueScheduleStartLabel",
+                "queue-schedule-start-hour",
+                "queue-schedule-start-minute",
+            ),
+            ScheduleSlot::Stop => (
+                "queueScheduleStopLabel",
+                "queue-schedule-stop-hour",
+                "queue-schedule-stop-minute",
+            ),
+        };
+        let unset = self.t("queueScheduleTimeUnset", cx);
+        let hour = time.map(|minutes| minutes / 60);
+        let minute = time.map_or(0, |minutes| minutes % 60);
+
+        let this = cx.weak_entity();
+        let unset_item = unset.clone();
+        let hour_button = Button::new(hour_id)
+            .outline()
+            .label(hour.map_or_else(|| unset.clone(), |h| SharedString::from(format!("{h:02}"))))
+            .dropdown_caret(true)
+            .control(cx)
+            .flex_1()
+            .min_w_0()
+            .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+                let clear = this.clone();
+                let menu = menu.scrollable(true).max_h(TIME_MENU_MAX_HEIGHT).item(
+                    PopupMenuItem::new(unset_item.clone())
+                        .checked(hour.is_none())
+                        .on_click(move |_, _, cx| {
+                            let _ = clear.update(cx, |this, cx| {
+                                this.set_schedule_time(slot, None, cx);
+                            });
+                        }),
+                );
+                (0..24u16).fold(menu, |menu, h| {
+                    let this = this.clone();
+                    menu.item(
+                        PopupMenuItem::new(SharedString::from(format!("{h:02}")))
+                            .checked(hour == Some(h))
+                            .on_click(move |_, _, cx| {
+                                let _ = this.update(cx, |this, cx| {
+                                    this.set_schedule_time(slot, Some(h * 60 + minute), cx);
+                                });
+                            }),
+                    )
+                })
+            });
+
+        let this = cx.weak_entity();
+        let minute_button = Button::new(minute_id)
+            .outline()
+            .label(match hour {
+                Some(_) => SharedString::from(format!("{minute:02}")),
+                None => SharedString::from("--"),
+            })
+            .dropdown_caret(true)
+            .control(cx)
+            .flex_1()
+            .min_w_0()
+            .disabled(hour.is_none())
+            .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+                let Some(hour) = hour else { return menu };
+                let menu = menu.scrollable(true).max_h(TIME_MENU_MAX_HEIGHT);
+                minute_choices(minute).into_iter().fold(menu, |menu, m| {
+                    let this = this.clone();
+                    menu.item(
+                        PopupMenuItem::new(SharedString::from(format!("{m:02}")))
+                            .checked(m == minute)
+                            .on_click(move |_, _, cx| {
+                                let _ = this.update(cx, |this, cx| {
+                                    this.set_schedule_time(slot, Some(hour * 60 + m), cx);
+                                });
+                            }),
+                    )
+                })
+            });
+
+        form_field(
+            self.t(label_key, cx),
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap(spacing.xs)
+                .child(hour_button)
+                .child(div().flex_none().child(":"))
+                .child(minute_button),
+            None,
+            cx,
+        )
+    }
+
     /// 定时：分组卡片首行为开关；开启后同卡片内追加「开始 | 停止」时间与星期复选行。
     fn render_schedule(&self, form: &QueueForm, cx: &mut Context<Self>) -> Div {
         let spacing = active_theme(cx).tokens().spacing;
@@ -684,24 +813,14 @@ impl QueueManagerView {
                     .gap(spacing.xs + spacing.xxs)
                     .child(form_row(
                         [
-                            self.render_field(
-                                "queueScheduleStartLabel",
-                                &form.schedule_start,
-                                None,
-                                cx,
-                            )
-                            .into_any_element(),
-                            self.render_field(
-                                "queueScheduleStopLabel",
-                                &form.schedule_stop,
-                                None,
-                                cx,
-                            )
-                            .into_any_element(),
+                            self.render_time_field(ScheduleSlot::Start, form.schedule_start, cx)
+                                .into_any_element(),
+                            self.render_time_field(ScheduleSlot::Stop, form.schedule_stop, cx)
+                                .into_any_element(),
                         ],
                         cx,
                     ))
-                    .child(field_hint(self.t("queueScheduleTimeHint", cx), cx)),
+                    .child(field_hint(self.t("queueScheduleTimePickHint", cx), cx)),
             )
             .child(form_field(
                 self.t("queueScheduleDays", cx),
@@ -889,23 +1008,32 @@ impl Render for QueueManagerView {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueueManagerView, toggle_day_bit};
+    use super::{format_time, minute_choices, parse_time, toggle_day_bit};
 
     #[test]
-    fn valid_time_accepts_empty_and_well_formed_hhmm() {
-        assert!(QueueManagerView::valid_time(""));
-        assert!(QueueManagerView::valid_time("9:30"));
-        assert!(QueueManagerView::valid_time("00:00"));
-        assert!(QueueManagerView::valid_time("23:59"));
+    fn parse_time_round_trips_wire_format() {
+        assert_eq!(parse_time("08:30"), Some(510));
+        assert_eq!(parse_time("9:05"), Some(545));
+        assert_eq!(format_time(parse_time("9:05")), "09:05");
+        assert_eq!(format_time(Some(23 * 60 + 59)), "23:59");
+        assert_eq!(format_time(None), "");
     }
 
     #[test]
-    fn valid_time_rejects_out_of_range_or_malformed() {
-        assert!(!QueueManagerView::valid_time("24:00"));
-        assert!(!QueueManagerView::valid_time("12:60"));
-        assert!(!QueueManagerView::valid_time("12"));
-        assert!(!QueueManagerView::valid_time("ab:cd"));
-        assert!(!QueueManagerView::valid_time("-1:00"));
+    fn parse_time_treats_empty_or_invalid_as_unset() {
+        assert_eq!(parse_time(""), None);
+        assert_eq!(parse_time("24:00"), None);
+        assert_eq!(parse_time("12:60"), None);
+        assert_eq!(parse_time("12"), None);
+        assert_eq!(parse_time("ab:cd"), None);
+    }
+
+    #[test]
+    fn minute_choices_keep_off_step_current_value_in_order() {
+        assert_eq!(minute_choices(0).len(), 12);
+        let choices = minute_choices(7);
+        assert_eq!(choices.len(), 13);
+        assert_eq!(&choices[..3], &[0, 5, 7]);
     }
 
     #[test]
