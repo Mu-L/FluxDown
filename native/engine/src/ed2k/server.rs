@@ -133,20 +133,29 @@ fn parse_server_addr(s: &str) -> Option<(String, u16)> {
     Some((host.to_owned(), port))
 }
 
-/// 把逗号分隔的 `ed2k_server_list` 配置值解析为服务器地址列表。
+/// 把 `ed2k_server_list` 配置值解析为服务器地址列表。
+///
+/// 规范存储是逗号分隔；同时接受换行/空白分隔（`host:port` 不含空白），
+/// 兼容按行编辑写入的旧值。
 ///
 /// # Examples
 ///
 /// ```
 /// use fluxdown_engine::ed2k::server::parse_server_list;
-/// let list = parse_server_list("1.2.3.4:4661, 5.6.7.8:4242");
-/// assert_eq!(list, vec!["1.2.3.4:4661".to_string(), "5.6.7.8:4242".to_string()]);
+/// let list = parse_server_list("1.2.3.4:4661, 5.6.7.8:4242\n9.9.9.9:4661");
+/// assert_eq!(
+///     list,
+///     vec![
+///         "1.2.3.4:4661".to_string(),
+///         "5.6.7.8:4242".to_string(),
+///         "9.9.9.9:4661".to_string(),
+///     ]
+/// );
 /// ```
 #[must_use]
 pub fn parse_server_list(config_value: &str) -> Vec<String> {
     config_value
-        .split(',')
-        .map(str::trim)
+        .split(|c: char| c == ',' || c.is_whitespace())
         .filter(|s| parse_server_addr(s).is_some())
         .map(str::to_owned)
         .collect()
@@ -454,6 +463,19 @@ mod tests {
         assert_eq!(
             list,
             vec!["1.2.3.4:4661".to_string(), "5.6.7.8:80".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_server_list_accepts_line_separated() {
+        let list = parse_server_list("1.2.3.4:4661\r\n5.6.7.8:80,\n\n9.9.9.9:4242");
+        assert_eq!(
+            list,
+            vec![
+                "1.2.3.4:4661".to_string(),
+                "5.6.7.8:80".to_string(),
+                "9.9.9.9:4242".to_string()
+            ]
         );
     }
 
