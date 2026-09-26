@@ -155,6 +155,30 @@ pub enum DownloadsResult {
     TaskActivity(TaskActivityPage),
 }
 
+impl DownloadsResult {
+    /// 建任务类命令（`daemon.task.create` → `{taskId}`、`agent.capture.resolve` /
+    /// 种子上传 → `{taskIds}`）返回的新任务 ID；其它结果为空。
+    #[must_use]
+    pub fn created_task_ids(&self) -> Vec<String> {
+        let Self::Value(value) = self else {
+            return Vec::new();
+        };
+        if let Some(id) = value.get("taskId").and_then(serde_json::Value::as_str) {
+            return vec![id.to_owned()];
+        }
+        value
+            .get("taskIds")
+            .and_then(serde_json::Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 pub trait DownloadsPort: Send + Sync {
     fn execute(&self, command: DownloadsCommand) -> PortFuture<DownloadsResult>;
 }
@@ -719,6 +743,16 @@ mod tests {
             "errorMessage":"","createdAt":"1","proxyUrl":"","queueId":"main","checksum":""
         }))
         .expect("task")
+    }
+
+    #[test]
+    fn created_task_ids_read_single_and_batch_create_results() {
+        let single = DownloadsResult::Value(json!({ "taskId": "a" }));
+        assert_eq!(single.created_task_ids(), ["a"]);
+        // 捕获确认里失败的条目为 null，不计入新任务。
+        let batch = DownloadsResult::Value(json!({ "taskIds": ["a", null, "b"] }));
+        assert_eq!(batch.created_task_ids(), ["a", "b"]);
+        assert!(DownloadsResult::Unit.created_task_ids().is_empty());
     }
 
     #[test]

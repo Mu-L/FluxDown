@@ -35,6 +35,8 @@ use crate::power::PowerService;
 const IDLE_EXIT_GRACE: Duration = Duration::from_secs(15);
 const CLOSE_TO_TRAY_KEY: &str = "close_to_tray";
 const START_MINIMIZED_TO_TRAY_KEY: &str = "start_minimized_to_tray";
+/// 官方 UI 的进度窗口开关（设备本地偏好，缺省开启）。
+const PROGRESS_WINDOW_PREF: &str = "desktop.progress_window";
 
 /// 托盘可用性，在 runtime 启动前由宿主确定，进程生命周期内不变。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,6 +241,41 @@ impl ShellState {
         let args: &[&str] = if self.resident() { &["--capture"] } else { &[] };
         if let Err(error) = crate::platform::launch_desktop(args) {
             tracing::warn!(error = %error, "could not launch desktop for pending prompt");
+        }
+    }
+
+    /// 静默捕获建成单个任务且没有 UI 连接时，拉起界面承载该任务的进度窗口（界面收到
+    /// `--progress-task` 后按用户开始处理）。进度窗口偏好关闭（`desktop.progress_window`
+    /// 为 false）或已有 UI（它会收到 `CaptureTasksStarted`）时不拉起；与确认拉起共用冷却。
+    pub fn launch_for_progress(&self, task_id: &str) {
+        let enabled = self.events.inspect(|snapshot| {
+            snapshot
+                .preferences
+                .values
+                .get(PROGRESS_WINDOW_PREF)
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        });
+        if !enabled {
+            return;
+        }
+        let now = crate::platform::now_unix_ms();
+        let last = self.last_prompt_launch_ms.load(Ordering::Acquire);
+        if !crate::platform::should_launch_for_prompt(self.ui_clients(), last, now)
+            || self
+                .last_prompt_launch_ms
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        let mut args = Vec::with_capacity(3);
+        if self.resident() {
+            args.push("--capture");
+        }
+        args.extend(["--progress-task", task_id]);
+        if let Err(error) = crate::platform::launch_desktop(&args) {
+            tracing::warn!(error = %error, "could not launch desktop for progress window");
         }
     }
 

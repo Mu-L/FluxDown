@@ -61,6 +61,9 @@ pub type IdOpener = Rc<dyn Fn(String, &mut Window, &mut App)>;
 pub type PlainOpener = Rc<dyn Fn(&mut Window, &mut App)>;
 /// 分类编辑入口：`Some(id)` 编辑现有分类，`None` 新建。
 pub type CategoryEditorOpener = Rc<dyn Fn(Option<String>, &mut Window, &mut App)>;
+/// 用户在场亲手开始了一个任务（单任务继续 / 重新下载 / 新建单任务成功）；宿主据此弹
+/// 独立进度窗口。
+pub type UserStartHook = Rc<dyn Fn(String, &mut App)>;
 
 /// app 注入的跨窗口 / 跨能力入口；未注入的入口对应按钮无动作。
 #[derive(Clone, Default)]
@@ -75,6 +78,8 @@ pub struct DownloadHostActions {
     pub shutdown_status: Option<crate::model::shutdown::SharedShutdownStatus>,
     /// 状态栏发起关机请求的端口。
     pub shutdown: Option<crate::model::shutdown::ShutdownPort>,
+    /// 单任务交互式开始成功后回调（批量操作不回调）。
+    pub on_user_started: Option<UserStartHook>,
 }
 
 /// 下载能力的顶层页面。
@@ -273,6 +278,7 @@ impl DownloadView {
             })
             .detach();
         }
+        let starts_immediately = submission.starts_immediately();
         let futures = submission
             .into_commands()
             .into_iter()
@@ -280,15 +286,29 @@ impl DownloadView {
             .collect::<Vec<_>>();
         cx.spawn(async move |this, cx| {
             let mut failed = false;
+            let mut created = Vec::new();
             for future in futures {
-                failed |= future.await.is_err();
+                match future.await {
+                    Ok(result) => created.extend(result.created_task_ids()),
+                    Err(_) => failed = true,
+                }
             }
             let _ = this.update(cx, |this, cx| {
                 this.last_error = failed.then(|| this.strings.action_failed.clone());
+                if starts_immediately {
+                    this.notify_user_started(&created, cx);
+                }
                 cx.notify();
             });
             !failed
         })
+    }
+
+    /// 只有恰好一个任务被交互式开始时通知宿主（批量不逐个弹窗）。
+    pub(crate) fn notify_user_started(&self, task_ids: &[String], cx: &mut App) {
+        if let ([task_id], Some(hook)) = (task_ids, self.host.on_user_started.as_ref()) {
+            hook(task_id.clone(), cx);
+        }
     }
 
     pub fn replace_snapshot(

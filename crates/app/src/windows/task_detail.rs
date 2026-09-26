@@ -41,6 +41,7 @@ pub fn open(cx: &mut App, task_id: String) {
             open_group_window: Some(Rc::new(|group_id, _window, cx| {
                 crate::windows::group_detail::open(cx, group_id);
             })),
+            on_user_started: Some(Rc::new(crate::progress_windows::user_started)),
             ..DownloadHostActions::default()
         };
         let detail = cx.new(|cx| {

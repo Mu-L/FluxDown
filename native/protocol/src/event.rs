@@ -135,6 +135,9 @@ pub enum AgentEvent {
     PendingCapturesChanged(Vec<PendingCaptureDto>),
     ShellChanged(ShellStatusDto),
     PowerChanged(PowerStatusDto),
+    /// 外部捕获未经确认直接建成的任务（免打扰下载 / 系统打开链接 / 拖入）。一次性通知，
+    /// 不进快照；官方 UI 据此为单任务弹出进度窗口。失败条目不在列表中。
+    CaptureTasksStarted(Vec<String>),
 }
 
 /// `service.event` notification 的事件主体。
@@ -179,6 +182,7 @@ pub fn apply_agent_event(snapshot: &mut AgentSnapshot, event: &AgentEvent) {
         }
         AgentEvent::ShellChanged(shell) => snapshot.shell.clone_from(shell),
         AgentEvent::PowerChanged(power) => snapshot.power = *power,
+        AgentEvent::CaptureTasksStarted(_) => {}
     }
 }
 

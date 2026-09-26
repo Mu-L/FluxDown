@@ -22,17 +22,23 @@ pub struct LaunchOptions {
     pub urls: Vec<String>,
     /// 需要经 agent 上传后建任务的本机 `.torrent` 文件。
     pub torrent_files: Vec<PathBuf>,
+    /// agent 静默建成单个任务后拉起界面时携带：该任务按用户开始处理（弹进度窗口）。
+    pub progress_task: Option<String>,
 }
 
 impl LaunchOptions {
     #[must_use]
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Self {
         let mut options = Self::default();
-        for arg in args {
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--minimized" | "--start-minimized" => options.minimized = true,
                 "--capture" => options.capture_only = true,
                 "--activate-existing" => options.activate_existing = true,
+                "--progress-task" => {
+                    options.progress_task = args.next().filter(|task_id| !task_id.is_empty());
+                }
                 value if capture_link::is_capture_url(value) => options.urls.push(value.to_owned()),
                 value if value.starts_with("--") => {}
                 value => {
@@ -129,6 +135,10 @@ mod tests {
         assert!(options.minimized);
         assert!(options.activate_existing);
         assert_eq!(options.urls, vec!["magnet:?xt=urn:btih:abc"]);
+        let options =
+            LaunchOptions::from_args(["--capture", "--progress-task", "task-1"].map(str::to_owned));
+        assert!(options.capture_only);
+        assert_eq!(options.progress_task.as_deref(), Some("task-1"));
         assert!(options.torrent_files.is_empty());
         let file = std::env::temp_dir().join(format!("fluxdown-{}.torrent", std::process::id()));
         std::fs::write(&file, b"d8:announce0:e").expect("write");

@@ -315,6 +315,11 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         // 不依赖主窗口存在。
         crate::windows::selection::install(cx);
         crate::windows::new_download::install_captures(cx);
+        crate::progress_windows::install(cx);
+        if let Some(task_id) = launch.progress_task.clone() {
+            // 须先于下方「无待确认即退出」登记：意图的界面保活会推迟那次退出。
+            crate::progress_windows::user_started_on_launch(task_id, cx);
+        }
 
         if launch.capture_only {
             // 由 agent 为待确认交互拉起：不开主窗口；确认窗口随快照 / 事件打开，全部关闭后由

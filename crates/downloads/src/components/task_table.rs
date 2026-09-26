@@ -1151,17 +1151,16 @@ impl DownloadTableDelegate {
     /// 文件类型图标与类别名。
     fn kind_visual(&self, kind: TaskKind) -> (FluxIcon, SharedString) {
         let strings = &self.strings;
-        match kind {
-            TaskKind::Video => (FluxIcon::FilePlay, strings.category_video.clone()),
-            TaskKind::Audio => (FluxIcon::FileMusic, strings.category_audio.clone()),
-            TaskKind::Document => (FluxIcon::FileText, strings.category_document.clone()),
-            TaskKind::Image => (FluxIcon::FileImage, strings.category_image.clone()),
-            TaskKind::Archive => (FluxIcon::FileArchive, strings.category_archive.clone()),
-            TaskKind::DiskImage => (FluxIcon::Disc3, strings.category_archive.clone()),
-            TaskKind::Application => (FluxIcon::AppWindow, strings.category_program.clone()),
-            TaskKind::Mobile => (FluxIcon::Smartphone, strings.category_program.clone()),
-            TaskKind::Other => (FluxIcon::File, strings.category_other.clone()),
-        }
+        let label = match kind {
+            TaskKind::Video => &strings.category_video,
+            TaskKind::Audio => &strings.category_audio,
+            TaskKind::Document => &strings.category_document,
+            TaskKind::Image => &strings.category_image,
+            TaskKind::Archive | TaskKind::DiskImage => &strings.category_archive,
+            TaskKind::Application | TaskKind::Mobile => &strings.category_program,
+            TaskKind::Other => &strings.category_other,
+        };
+        (kind_icon(kind), label.clone())
     }
 
     /// 状态列主文案：下载中显示「速度 · 剩余时间」（只显示已知部分），其余为状态名。
@@ -2351,6 +2350,21 @@ pub(crate) fn progress_bar_color(state: TaskState, cx: &App) -> Hsla {
     }
 }
 
+/// 文件类型图标：任务表与独立进度窗口共用。
+pub(crate) fn kind_icon(kind: TaskKind) -> FluxIcon {
+    match kind {
+        TaskKind::Video => FluxIcon::FilePlay,
+        TaskKind::Audio => FluxIcon::FileMusic,
+        TaskKind::Document => FluxIcon::FileText,
+        TaskKind::Image => FluxIcon::FileImage,
+        TaskKind::Archive => FluxIcon::FileArchive,
+        TaskKind::DiskImage => FluxIcon::Disc3,
+        TaskKind::Application => FluxIcon::AppWindow,
+        TaskKind::Mobile => FluxIcon::Smartphone,
+        TaskKind::Other => FluxIcon::File,
+    }
+}
+
 /// 进度轨道颜色：muted_foreground 的淡化派生。主表格与详情窗口共用。
 pub(crate) fn progress_track_color(cx: &App) -> Hsla {
     active_theme(cx)
@@ -2477,18 +2491,32 @@ impl DownloadView {
         self.execute_commands(commands, cx);
     }
 
-    /// 逐条执行；任一失败在页面横幅提示。
+    /// 逐条执行；任一失败在页面横幅提示。只含一条单任务「继续」/「重新下载」时，成功后
+    /// 通知宿主这是一次交互式开始（批量选择不逐个弹进度窗口）。
     pub(crate) fn execute_commands(
         &mut self,
         commands: Vec<DownloadsCommand>,
         cx: &mut Context<Self>,
     ) {
+        let interactive_start = match commands.as_slice() {
+            [DownloadsCommand::Resume { task_id }] => Some(Some(task_id.clone())),
+            [DownloadsCommand::Redownload(request, _)] if !request.start_paused => Some(None),
+            _ => None,
+        };
         for command in commands {
             let future = self.controller.execute(command);
+            let interactive_start = interactive_start.clone();
             cx.spawn(async move |this, cx| {
-                let failed = future.await.is_err();
+                let result = future.await;
+                let failed = result.is_err();
                 let _ = this.update(cx, |this, cx| {
                     this.last_error = failed.then(|| this.strings.action_failed.clone());
+                    if let (Ok(result), Some(resumed)) = (&result, interactive_start) {
+                        // 继续：原任务 ID；重新下载：响应里的新任务 ID。
+                        let started =
+                            resumed.map_or_else(|| result.created_task_ids(), |id| vec![id]);
+                        this.notify_user_started(&started, cx);
+                    }
                     cx.notify();
                 });
             })

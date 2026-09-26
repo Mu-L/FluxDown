@@ -124,6 +124,8 @@ impl CaptureService {
         self.enqueue(requests).await
     }
 
+    /// 直接建任务（不经确认）。建成的任务随后以 [`AgentEvent::CaptureTasksStarted`] 通知官方
+    /// UI（进度窗口）；单个任务且当前没有 UI 连接时按需拉起界面承载进度窗口。
     async fn create_all(
         &self,
         requests: Vec<DownloadRequest>,
@@ -131,15 +133,34 @@ impl CaptureService {
         unattended: bool,
     ) -> Result<Value, CaptureError> {
         let mut task_ids = Vec::with_capacity(requests.len());
+        let mut started = Vec::with_capacity(requests.len());
+        let mut outcome = Ok(());
         for request in requests {
             let mut create = captured_create_request(request);
             if let Some(dir) = fallback_save_dir {
                 fill_if_blank(&mut create.save_dir, dir.to_owned());
             }
-            let created = self.create(create, None, unattended).await?;
-            task_ids.push(created.get("taskId").cloned().unwrap_or(Value::Null));
+            let created = match self.create(create, None, unattended).await {
+                Ok(created) => created,
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                }
+            };
+            let task_id = created.get("taskId").cloned().unwrap_or(Value::Null);
+            if let Some(id) = task_id.as_str() {
+                started.push(id.to_owned());
+            }
+            task_ids.push(task_id);
         }
-        Ok(json!({ "taskIds": task_ids }))
+        if !started.is_empty() {
+            if let [task_id] = started.as_slice() {
+                self.shell.launch_for_progress(task_id);
+            }
+            self.events
+                .publish(AgentEvent::CaptureTasksStarted(started));
+        }
+        outcome.map(|()| json!({ "taskIds": task_ids }))
     }
 
     async fn enqueue(&self, requests: Vec<DownloadRequest>) -> Result<Value, CaptureError> {

@@ -24,6 +24,7 @@ use crate::{agent_client::AgentClient, app::Desktop};
 pub mod group_detail;
 pub mod main;
 pub mod new_download;
+pub mod progress;
 pub mod queue_manager;
 pub mod selection;
 pub mod settings;
@@ -39,6 +40,8 @@ pub enum WindowKey {
     Selection(String),
     TaskDetail(String),
     GroupDetail(String),
+    /// 独立下载进度 / 完成窗口（每任务一个）。
+    Progress(String),
 }
 
 impl WindowKey {
@@ -209,6 +212,16 @@ impl WindowRegistry {
         cx.global::<Self>().open.len()
     }
 
+    /// 满足条件的已开窗口数量。
+    #[must_use]
+    pub fn count(cx: &App, predicate: impl Fn(&WindowKey) -> bool) -> usize {
+        cx.global::<Self>()
+            .open
+            .keys()
+            .filter(|key| predicate(key))
+            .count()
+    }
+
     /// 在根视图上挂窗口边界观察，500ms 防抖后写入设备本地偏好。
     pub fn persist_bounds<V: 'static>(
         key: &WindowKey,
@@ -271,6 +284,22 @@ impl WindowRegistry {
             _ => WindowBounds::Windowed(Bounds::centered(None, default_size, cx)),
         }
     }
+}
+
+/// 把窗口连同应用一起置前（界面常是后台应用：外部捕获、静默下载发生时浏览器在前台）：
+///
+/// - macOS：`activate_window` 只在本应用内排序（`makeKeyAndOrderFront`），必须同时
+///   `cx.activate(true)` 激活应用本身（`activateIgnoringOtherApps`），否则窗口压在浏览器下面。
+/// - Windows：`cx.activate` 为空操作；gpui 的 `activate_window` 以 `SetForegroundWindow` +
+///   模拟一次按键输入绕过前台锁，后台进程也能置前。
+/// - Linux：X11 发 `_NET_ACTIVE_WINDOW`、Wayland 申请 xdg-activation token，窗口管理器的
+///   防抢焦点策略可能拒绝；再请求注意（X11 置 urgency，任务栏 / 工作区高亮），被拒时
+///   用户仍能看到有待确认的下载。
+pub fn bring_to_front(window: &mut Window, cx: &mut App) {
+    cx.activate(true);
+    window.activate_window();
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    window.request_attention();
 }
 
 /// 「下载仍在进行」确认框：用户确认后执行 `on_ok`（关窗 / 退出）。同一窗口已在提示中

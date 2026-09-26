@@ -15,6 +15,7 @@ mod launch;
 mod lifecycle;
 mod menus;
 mod power;
+mod progress_windows;
 mod service_bootstrap;
 mod session;
 mod settings_port;

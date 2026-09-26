@@ -22,8 +22,9 @@ use crate::{
     model::new_download::{
         DEFAULT_HASH_ALGORITHM, DraftOptions, HASH_ALGORITHMS, MAX_THREADS, ProxyChoice,
         THREAD_PRESETS, ThreadChoice, UA_PRESET_CUSTOM, UA_PRESET_DEFAULT, UrlEntry,
-        append_entries, build_requests, checksum_spec, custom_segments, detect_ua_preset,
-        manual_proxy_url, merge_imported, parse_entries, ua_preset_keys, ua_preset_value,
+        append_entries, build_requests, capture_entry, checksum_spec, custom_segments,
+        detect_ua_preset, manual_proxy_url, merge_imported, parse_entries, ua_preset_keys,
+        ua_preset_value,
     },
     strings::NewDownloadStrings,
 };
@@ -176,6 +177,18 @@ pub enum NewDownloadSubmission {
 }
 
 impl NewDownloadSubmission {
+    /// 提交后任务立即开始（非「稍后下载」）；本机种子文件由 agent 直接开始。
+    #[must_use]
+    pub fn starts_immediately(&self) -> bool {
+        match self {
+            Self::Tasks { tasks, captures } => tasks
+                .iter()
+                .chain(captures.iter().map(|capture| &capture.request))
+                .all(|request| !request.start_paused),
+            Self::TorrentFiles(_) => true,
+        }
+    }
+
     /// 「上次保存目录」偏好写入（尽力而为，失败不影响建任务）。
     #[must_use]
     pub fn remember_save_dir_command(&self) -> Option<DownloadsCommand> {
@@ -464,11 +477,9 @@ impl NewDownloadView {
         }
         let text = append_entries(
             &current,
-            fresh.iter().map(|capture| UrlEntry {
-                url: capture.url.clone(),
-                file_name: capture.file_name.clone(),
-                checksum: String::new(),
-            }),
+            fresh
+                .iter()
+                .map(|capture| capture_entry(&capture.url, &capture.file_name)),
         );
         self.urls
             .update(cx, |input, cx| input.set_value(text, window, cx));
@@ -976,14 +987,15 @@ impl NewDownloadView {
         }
     }
 
-    /// 多行输入（链接 / Cookie）：13px 正文、宽松内边距，与单行输入框同一视觉体系。
+    /// 多行输入（链接 / Cookie）：13px 正文，与单行输入框同一视觉体系。
+    ///
+    /// 不要再加 `px`/`py`：多行 `Input` 已按尺寸给内部编辑区设置了内边距，外层再叠
+    /// 一层会让文字离边框两倍远。
     fn textarea(state: &Entity<TextareaState>, height: Pixels, cx: &App) -> Textarea {
         let tokens = active_theme(cx).tokens();
         Textarea::new(state)
             .h(height)
             .w_full()
-            .px(tokens.spacing.md)
-            .py(tokens.spacing.sm)
             .text_size(tokens.typography.sm.size)
             .line_height(tokens.typography.sm.line_height)
     }

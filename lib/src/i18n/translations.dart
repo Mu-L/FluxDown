@@ -905,6 +905,19 @@ class S {
   String get torrentAssocDialogDesc => _r('torrentAssocDialogDesc');
   String get notifyOnComplete => _r('notifyOnComplete');
   String get notifyOnCompleteDesc => _r('notifyOnCompleteDesc');
+  String get progressWindowGroup => _r('progressWindowGroup');
+  String get showProgressWindow => _r('showProgressWindow');
+  String get showProgressWindowDesc => _r('showProgressWindowDesc');
+  String get showCompletionWindow => _r('showCompletionWindow');
+  String get showCompletionWindowDesc => _r('showCompletionWindowDesc');
+  String get progressWindowTitle => _r('progressWindowTitle');
+  String get progressWindowStop => _r('progressWindowStop');
+  String progressWindowSegments(int n) =>
+      _r('progressWindowSegments', {'n': n});
+  String get progressWindowPartsShow => _r('progressWindowPartsShow');
+  String get progressWindowPartsHide => _r('progressWindowPartsHide');
+  String get progressWindowPartWaiting => _r('progressWindowPartWaiting');
+  String get progressWindowShowCompletion => _r('progressWindowShowCompletion');
   String get silentDownload => _r('silentDownload');
   String get silentDownloadDesc => _r('silentDownloadDesc');
   String get silentSkipSelection => _r('silentSkipSelection');

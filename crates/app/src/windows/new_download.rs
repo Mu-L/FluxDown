@@ -124,7 +124,7 @@ fn sync_captures(cx: &mut App, pending: &[PendingCaptureDto]) {
                 }
             });
             if arrived {
-                bring_to_front(window, cx);
+                crate::windows::bring_to_front(window, cx);
             }
         });
         if delivered.is_ok() {
@@ -192,26 +192,14 @@ fn open_with(cx: &mut App, context: NewDownloadContext, captures: Vec<PendingCap
         });
     // 菜单入口与外部捕获都是需要用户立即处理的操作：macOS 后台时也要将窗口及应用置前。
     if let Some(handle) = handle {
-        let _ = handle.update(cx, |_, window, cx| bring_to_front(window, cx));
+        let _ = handle.update(cx, |_, window, cx| {
+            crate::windows::bring_to_front(window, cx)
+        });
     } else if let Some(handle) = WindowRegistry::handle(cx, &WindowKey::NewDownload) {
-        let _ = handle.update(cx, |_, window, cx| bring_to_front(window, cx));
+        let _ = handle.update(cx, |_, window, cx| {
+            crate::windows::bring_to_front(window, cx)
+        });
     }
-}
-
-/// 置前表单窗口（外部捕获通常发生在浏览器处于前台时，界面是后台应用）：
-///
-/// - macOS：`activate_window` 只在本应用内排序（`makeKeyAndOrderFront`），必须同时
-///   `cx.activate(true)` 激活应用本身（`activateIgnoringOtherApps`），否则窗口压在浏览器下面。
-/// - Windows：`cx.activate` 为空操作；gpui 的 `activate_window` 以 `SetForegroundWindow` +
-///   模拟一次按键输入绕过前台锁，后台进程也能置前。
-/// - Linux：X11 发 `_NET_ACTIVE_WINDOW`、Wayland 申请 xdg-activation token，窗口管理器的
-///   防抢焦点策略可能拒绝；再请求注意（X11 置 urgency，任务栏 / 工作区高亮），被拒时
-///   用户仍能看到有待确认的下载。
-fn bring_to_front(window: &mut gpui::Window, cx: &mut App) {
-    cx.activate(true);
-    window.activate_window();
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    window.request_attention();
 }
 
 /// 表单关闭时仍未确认的捕获：逐条忽略，界面退出前等它们送达 agent。
@@ -246,18 +234,28 @@ fn submit(submission: NewDownloadSubmission, port: &AgentDownloadsPort, cx: &mut
             let remember = submission
                 .remember_save_dir_command()
                 .map(|command| port.execute(command));
+            let starts_immediately = submission.starts_immediately();
             let commands = submission
                 .into_commands()
                 .into_iter()
                 .map(|command| port.execute(command))
                 .collect::<Vec<_>>();
-            cx.spawn(async move |_| {
+            cx.spawn(async move |cx| {
                 if let Some(remember) = remember {
                     let _ = remember.await;
                 }
                 let mut ok = true;
+                let mut created = Vec::new();
                 for command in commands {
-                    ok &= command.await.is_ok();
+                    match command.await {
+                        Ok(result) => created.extend(result.created_task_ids()),
+                        Err(_) => ok = false,
+                    }
+                }
+                // 与主窗口下载页同一规则：恰好一个任务立即开始才弹进度窗口。
+                if let ([task_id], true) = (created.as_slice(), starts_immediately) {
+                    let task_id = task_id.clone();
+                    cx.update(|cx| crate::progress_windows::user_started(task_id, cx));
                 }
                 ok
             })

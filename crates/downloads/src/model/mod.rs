@@ -1,5 +1,6 @@
 pub(crate) mod categories;
 pub(crate) mod new_download;
+pub(crate) mod progress_window;
 pub(crate) mod shutdown;
 pub(crate) mod store;
 pub(crate) mod view_prefs;

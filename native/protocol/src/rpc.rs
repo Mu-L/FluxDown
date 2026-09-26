@@ -7,10 +7,11 @@ use crate::error::{ApplicationErrorCode, RpcErrorData, RpcErrorObject};
 
 /// JSON-RPC wire 版本。
 pub const JSONRPC_VERSION: &str = "2.0";
-/// 当前本机服务协议版本；v4 增加托盘驻留（`ShellChanged`）与完成后关机（`PowerChanged`）事件。
-pub const PROTOCOL_VERSION: u32 = 4;
-/// v3 客户端不能解析新增事件，必须在握手时拒绝混用而非运行中断连。
-pub const MIN_PROTOCOL_VERSION: u32 = 4;
+/// 当前本机服务协议版本；v4 增加托盘驻留（`ShellChanged`）与完成后关机（`PowerChanged`）事件，
+/// v5 增加静默捕获建任务通知（`CaptureTasksStarted`）。
+pub const PROTOCOL_VERSION: u32 = 5;
+/// 旧客户端不能解析新增事件，必须在握手时拒绝混用而非运行中断连。
+pub const MIN_PROTOCOL_VERSION: u32 = 5;
 /// 服务收到 `system.shutdown` 而退出时的 WebSocket 关闭原因：客户端据此停止重连与重拉。
 pub const CLOSE_REASON_SERVICE_QUIT: &str = "service-quit";
 
@@ -311,7 +312,7 @@ mod tests {
                 "role": "agent",
                 "serviceName": "fluxdown-agent",
                 "serviceVersion": "1.0.0",
-                "protocolVersion": 4,
+                "protocolVersion": 5,
                 "instanceId": "instance-1",
                 "capabilities": ["agent.gateway"]
             })

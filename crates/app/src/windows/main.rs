@@ -152,6 +152,7 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
                 })),
                 shutdown_status,
                 shutdown: shutdown_port,
+                on_user_started: Some(Rc::new(crate::progress_windows::user_started)),
             });
         });
 

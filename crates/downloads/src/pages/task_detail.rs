@@ -519,16 +519,31 @@ impl TaskDetailView {
         };
         let active = matches!(row.state, TaskState::Downloading | TaskState::Pending);
         drop(row);
-        let command = if active {
-            DownloadsCommand::Pause {
-                task_id: self.task_id.clone(),
-            }
-        } else {
-            DownloadsCommand::Resume {
-                task_id: self.task_id.clone(),
-            }
-        };
-        self.run_command(command, cx);
+        if active {
+            self.run_command(
+                DownloadsCommand::Pause {
+                    task_id: self.task_id.clone(),
+                },
+                cx,
+            );
+            return;
+        }
+        let task_id = self.task_id.clone();
+        let future = self.port.execute(DownloadsCommand::Resume {
+            task_id: task_id.clone(),
+        });
+        cx.spawn(async move |this, cx| {
+            let failed = future.await.is_err();
+            let _ = this.update(cx, |this, cx| {
+                if failed {
+                    this.last_error = Some(this.strings.action_failed.clone());
+                } else if let Some(hook) = this.host.on_user_started.clone() {
+                    hook(task_id, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn copy_link(&mut self, cx: &mut Context<Self>) {
