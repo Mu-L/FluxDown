@@ -1,13 +1,16 @@
-//! 开机自启：登录时以 `--minimized` 拉起同级 `fluxdown-desktop`。
+//! 开机自启：登录时以 `--autostart` 拉起同级 `fluxdown-agent`，由 agent 按托盘偏好决定
+//! 只驻留托盘还是再拉起 `fluxdown-desktop --minimized`。
 //!
 //! - Windows：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `FluxDown`
 //!   值（与 Flutter 时代 `launch_at_startup` 及 `installer/windows/setup.iss`
 //!   的 `RemoveAutostartRunValue` 使用同一值名）。
-//! - macOS：`~/Library/LaunchAgents/dev.zerx.fluxdown.desktop.plist`（RunAtLoad）。
+//! - macOS：`~/Library/LaunchAgents/dev.zerx.fluxdown.desktop.plist`（RunAtLoad；沿用旧文件名，
+//!   升级后原条目被原地改写而不是遗留两份）。
 //! - Linux：`~/.config/autostart/fluxdown.desktop`（XDG autostart）。
 //!
-//! “已启用”要求条目指向当前桌面程序；程序移动/升级后旧条目视为未启用，
-//! 用户重新开启即覆盖为新路径。
+//! “已启用”要求条目以 `--autostart` 指向当前 agent；程序移动/升级后旧条目视为未启用，
+//! 用户重新开启即覆盖为新路径。[`targets`] 只判断条目是否指向某个可执行文件，用于识别
+//! 并迁移旧版直接拉起桌面程序的条目。
 
 #[cfg(target_os = "windows")]
 mod inner {
@@ -16,7 +19,7 @@ mod inner {
     use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 
-    use crate::platform::{PlatformError, registry_executable};
+    use crate::platform::{AUTOSTART_ARG, PlatformError, registry_executable};
 
     const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     const VALUE_NAME: &str = "FluxDown";
@@ -26,23 +29,32 @@ mod inner {
     }
 
     fn command_line(exe: &str) -> String {
-        format!("\"{exe}\" --minimized")
+        format!("\"{exe}\" {AUTOSTART_ARG}")
     }
 
-    pub fn is_enabled(desktop: &Path) -> bool {
-        let Ok(exe) = registry_executable(Some(desktop)) else {
-            return false;
-        };
+    fn registered_value() -> Option<String> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let Ok(key) = hkcu.open_subkey_with_flags(RUN_KEY, KEY_READ) else {
-            return false;
-        };
-        key.get_value::<String, _>(VALUE_NAME)
-            .is_ok_and(|value| value.eq_ignore_ascii_case(&command_line(&exe)))
+        let key = hkcu.open_subkey_with_flags(RUN_KEY, KEY_READ).ok()?;
+        key.get_value::<String, _>(VALUE_NAME).ok()
     }
 
-    pub fn enable(desktop: &Path) -> Result<(), PlatformError> {
-        let exe = registry_executable(Some(desktop))?;
+    pub fn is_enabled(agent: &Path) -> bool {
+        let Ok(exe) = registry_executable(Some(agent)) else {
+            return false;
+        };
+        registered_value().is_some_and(|value| value.eq_ignore_ascii_case(&command_line(&exe)))
+    }
+
+    pub fn targets(executable: &Path) -> bool {
+        let Ok(exe) = registry_executable(Some(executable)) else {
+            return false;
+        };
+        let quoted = format!("\"{exe}\"").to_ascii_lowercase();
+        registered_value().is_some_and(|value| value.to_ascii_lowercase().starts_with(&quoted))
+    }
+
+    pub fn enable(agent: &Path) -> Result<(), PlatformError> {
+        let exe = registry_executable(Some(agent))?;
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (key, _) = hkcu.create_subkey_with_flags(RUN_KEY, KEY_WRITE)?;
         key.set_value(VALUE_NAME, &command_line(&exe))?;
@@ -71,7 +83,7 @@ mod inner {
 mod inner {
     use std::path::{Path, PathBuf};
 
-    use crate::platform::PlatformError;
+    use crate::platform::{AUTOSTART_ARG, PlatformError};
 
     const LABEL: &str = "dev.zerx.fluxdown.desktop";
 
@@ -102,8 +114,15 @@ mod inner {
         out
     }
 
-    fn plist_body(desktop: &Path) -> String {
-        let program = xml_escape(&desktop.display().to_string());
+    fn program_element(executable: &Path) -> String {
+        format!(
+            "<string>{}</string>",
+            xml_escape(&executable.display().to_string())
+        )
+    }
+
+    fn plist_body(agent: &Path) -> String {
+        let program = program_element(agent);
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
@@ -114,8 +133,8 @@ mod inner {
              \t<string>{LABEL}</string>\n\
              \t<key>ProgramArguments</key>\n\
              \t<array>\n\
-             \t\t<string>{program}</string>\n\
-             \t\t<string>--minimized</string>\n\
+             \t\t{program}\n\
+             \t\t<string>{AUTOSTART_ARG}</string>\n\
              \t</array>\n\
              \t<key>RunAtLoad</key>\n\
              \t<true/>\n\
@@ -126,20 +145,27 @@ mod inner {
         )
     }
 
-    pub fn is_enabled(desktop: &Path) -> bool {
-        let Ok(path) = plist_path() else {
-            return false;
-        };
-        std::fs::read_to_string(path)
-            .is_ok_and(|content| content.contains(&xml_escape(&desktop.display().to_string())))
+    fn content() -> Option<String> {
+        std::fs::read_to_string(plist_path().ok()?).ok()
     }
 
-    pub fn enable(desktop: &Path) -> Result<(), PlatformError> {
+    pub fn is_enabled(agent: &Path) -> bool {
+        content().is_some_and(|content| {
+            content.contains(&program_element(agent))
+                && content.contains(&format!("<string>{AUTOSTART_ARG}</string>"))
+        })
+    }
+
+    pub fn targets(executable: &Path) -> bool {
+        content().is_some_and(|content| content.contains(&program_element(executable)))
+    }
+
+    pub fn enable(agent: &Path) -> Result<(), PlatformError> {
         let path = plist_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, plist_body(desktop))?;
+        std::fs::write(&path, plist_body(agent))?;
         tracing::info!(path = %path.display(), "enabled autostart");
         Ok(())
     }
@@ -160,7 +186,7 @@ mod inner {
 mod inner {
     use std::path::{Path, PathBuf};
 
-    use crate::platform::PlatformError;
+    use crate::platform::{AUTOSTART_ARG, PlatformError};
 
     pub fn supported(desktop: Option<&Path>) -> bool {
         desktop.is_some()
@@ -186,34 +212,46 @@ mod inner {
         out
     }
 
-    fn entry_body(desktop: &Path) -> String {
-        let exec = exec_quote(&desktop.display().to_string());
+    fn exec_line(agent: &Path) -> String {
+        format!(
+            "Exec={} {AUTOSTART_ARG}\n",
+            exec_quote(&agent.display().to_string())
+        )
+    }
+
+    fn entry_body(agent: &Path) -> String {
+        let exec = exec_line(agent);
         format!(
             "[Desktop Entry]\n\
              Type=Application\n\
              Name=FluxDown\n\
              Comment=Free IDM-alternative download manager\n\
-             Exec={exec} --minimized\n\
+             {exec}\
              Icon=com.fluxdown.app\n\
              Terminal=false\n\
              X-GNOME-Autostart-enabled=true\n"
         )
     }
 
-    pub fn is_enabled(desktop: &Path) -> bool {
-        let Ok(path) = entry_path() else {
-            return false;
-        };
-        std::fs::read_to_string(path)
-            .is_ok_and(|content| content.contains(&exec_quote(&desktop.display().to_string())))
+    fn content() -> Option<String> {
+        std::fs::read_to_string(entry_path().ok()?).ok()
     }
 
-    pub fn enable(desktop: &Path) -> Result<(), PlatformError> {
+    pub fn is_enabled(agent: &Path) -> bool {
+        content().is_some_and(|content| content.contains(&exec_line(agent)))
+    }
+
+    pub fn targets(executable: &Path) -> bool {
+        let exec = format!("Exec={}", exec_quote(&executable.display().to_string()));
+        content().is_some_and(|content| content.contains(&exec))
+    }
+
+    pub fn enable(agent: &Path) -> Result<(), PlatformError> {
         let path = entry_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, entry_body(desktop))?;
+        std::fs::write(&path, entry_body(agent))?;
         tracing::info!(path = %path.display(), "enabled autostart");
         Ok(())
     }
@@ -240,11 +278,15 @@ mod inner {
         false
     }
 
-    pub fn is_enabled(_desktop: &Path) -> bool {
+    pub fn is_enabled(_agent: &Path) -> bool {
         false
     }
 
-    pub fn enable(_desktop: &Path) -> Result<(), PlatformError> {
+    pub fn targets(_executable: &Path) -> bool {
+        false
+    }
+
+    pub fn enable(_agent: &Path) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported(
             "autostart is not supported on this platform",
         ))
@@ -257,4 +299,4 @@ mod inner {
     }
 }
 
-pub use inner::{disable, enable, is_enabled, supported};
+pub use inner::{disable, enable, is_enabled, supported, targets};

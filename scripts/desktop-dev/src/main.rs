@@ -11,6 +11,9 @@ const BUILD: &[&str] = &[
     "fluxdown_agent",
     "-p",
     "fluxdown_daemon",
+    // 官方桌面包的 agent 承载托盘与剪贴板监听；不带该 feature 时是 headless agent。
+    "--features",
+    "fluxdown_agent/desktop",
     "--bins",
 ];
 const PROBE_MARKER: &str = ".desktop-dev-activation-v1";

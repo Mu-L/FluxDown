@@ -9,9 +9,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use fluxdown_protocol::{AgentEvent, DaemonEvent, DaemonRuntimeStatsDto, ServiceEvent};
+use fluxdown_protocol::{
+    AgentEvent, DaemonEvent, DaemonRuntimeStatsDto, ServiceEvent, ShellStatusDto,
+};
 use fluxdown_ui_downloads::DownloadView;
-use fluxdown_ui_i18n::{I18nCatalog, I18nError, Translator};
+use fluxdown_ui_i18n::{I18nCatalog, I18nError, Translator, system_locale};
 use fluxdown_ui_settings::{SettingsStore, component_locale};
 use fluxdown_ui_shell::{RouteId, ShellView};
 use gpui::{App, AppContext as _, Entity, Global, WeakEntity};
@@ -77,8 +79,12 @@ pub(crate) struct Desktop {
     pub main_shell: Option<WeakEntity<ShellView>>,
     /// 最新偏好（快照 + `PreferencesChanged` 折叠）。
     pub preferences: BTreeMap<String, serde_json::Value>,
-    /// 最新运行时统计（关窗 / 退出提示与托盘 tooltip 用）。
+    /// 最新运行时统计（关窗 / 退出提示用）。
     pub runtime_stats: DaemonRuntimeStatsDto,
+    /// agent 托盘可用性与驻留策略：决定关闭主窗口是只退出界面还是完全退出。
+    pub shell: ShellStatusDto,
+    /// 已进入退出流程：窗口关闭回调不再重复触发退出。
+    pub quitting: bool,
 }
 
 impl Global for Desktop {}
@@ -94,14 +100,6 @@ impl Desktop {
 
     pub fn active_task_count(cx: &App) -> u32 {
         Self::global(cx).runtime_stats.active_tasks
-    }
-
-    pub fn pref_bool(cx: &App, key: &str, default: bool) -> bool {
-        Self::global(cx)
-            .preferences
-            .get(key)
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(default)
     }
 
     pub fn pref(cx: &App, key: &str) -> Option<serde_json::Value> {
@@ -148,7 +146,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
     #[cfg(windows)]
     start_windows_listener(&agent_client, endpoint, activate_tx)
         .map_err(AppError::ActivationListener)?;
-    submit_captures_detached(
+    let launch_submissions = submit_captures_detached(
         &agent_client,
         launch.urls.clone(),
         launch.torrent_files.clone(),
@@ -163,9 +161,9 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
             .collect();
         let urls = urls
             .into_iter()
-            .filter(|url| launch::is_capture_url(url))
+            .filter(|url| fluxdown_protocol::capture_link::is_capture_url(url))
             .collect();
-        submit_captures_detached(&open_urls_client, urls, files);
+        drop(submit_captures_detached(&open_urls_client, urls, files));
     });
     application.on_reopen(|cx| {
         if cx.has_global::<Desktop>() {
@@ -187,7 +185,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         fluxdown_ui_theme::init(cx);
         gpui_component::set_locale(&locale);
         let translator = cx.new(|_| translator);
-        let session = cx.new(|_| AgentSession::new(agent_client.clone()));
+        let session = cx.new(|cx| AgentSession::new(agent_client.clone(), cx));
         WindowRegistry::init(cx, agent_client.clone());
 
         // 设置存储跨窗口存活：窗口关闭后防抖中的写回仍完成，快照/事件持续进入。
@@ -197,9 +195,13 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         let quit_store = settings_store.clone();
         cx.on_app_quit(move |cx| {
             let calls = quit_store.update(cx, |store, _| store.drain_pending_calls());
+            let shutdown = crate::lifecycle::shutdown_request_on_app_quit(cx);
             async move {
                 for call in calls {
                     let _ = call.await;
+                }
+                if let Some(shutdown) = shutdown {
+                    let _ = shutdown.await;
                 }
             }
         })
@@ -218,6 +220,8 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
             main_shell: None,
             preferences: BTreeMap::new(),
             runtime_stats: DaemonRuntimeStatsDto::default(),
+            shell: ShellStatusDto::default(),
+            quitting: false,
         });
 
         // 会话 → 偏好 / 运行时统计折叠进 Desktop；外观与语言随偏好变化。
@@ -226,9 +230,11 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
                 if let Some(body) = crate::session::agent_body(snapshot) {
                     let values = body.preferences.values.clone();
                     let stats = body.daemon.runtime_stats.clone();
+                    let shell = body.shell.clone();
                     let desktop = Desktop::global_mut(cx);
                     desktop.preferences = values;
                     desktop.runtime_stats = stats;
+                    desktop.shell = shell;
                     apply_preferences(cx);
                 }
             }
@@ -236,6 +242,9 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
                 ServiceEvent::Agent(AgentEvent::PreferencesChanged(prefs)) => {
                     Desktop::global_mut(cx).preferences = prefs.values.clone();
                     apply_preferences(cx);
+                }
+                ServiceEvent::Agent(AgentEvent::ShellChanged(shell)) => {
+                    Desktop::global_mut(cx).shell = shell.clone();
                 }
                 ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::RuntimeStatsChanged(
                     stats,
@@ -254,6 +263,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
             SessionSignal::Fatal(error) => {
                 eprintln!("fatal FluxDown agent error: {:?}", error.code);
             }
+            SessionSignal::ServiceStopped => crate::lifecycle::service_stopped(cx),
             SessionSignal::Stale => {}
         })
         .detach();
@@ -284,7 +294,11 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         cx.spawn(async move |cx| {
             while let Some(request) = activate_rx.recv().await {
                 let (message, acknowledgement) = request.into_parts();
-                submit_captures_detached(&activate_client, message.urls, message.files);
+                drop(submit_captures_detached(
+                    &activate_client,
+                    message.urls,
+                    message.files,
+                ));
                 if message.activate {
                     cx.update(crate::windows::main::reveal);
                 }
@@ -293,25 +307,27 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         })
         .detach();
 
-        // 常驻能力：托盘 / 剪贴板监听 / 完成后关机（须在下方启动分支判断 resident 前完成安装）。
-        crate::tray::install(cx);
-        crate::clipboard_watch::install(cx);
+        // 常驻能力归 agent（托盘 / 剪贴板监听 / 完成后关机执行）；这里只装界面投影。
         crate::power::install(cx);
-        // 引擎选择请求 / 外部捕获确认窗口：跟随会话事件独立开关，不依赖主窗口存在。
+        // 引擎选择请求窗口 / 外部捕获确认（并入新建下载窗口）：跟随会话事件独立开关，
+        // 不依赖主窗口存在。
         crate::windows::selection::install(cx);
-        crate::windows::quick_capture::install(cx);
+        crate::windows::new_download::install_captures(cx);
 
         if launch.capture_only {
-            // 由 agent 为捕获拉起：不开主窗口；捕获窗口随 `PendingCapturesChanged` 打开，
-            // 清空后由退出判定收尾。
+            // 由 agent 为待确认交互拉起：不开主窗口；确认窗口随快照 / 事件打开，全部关闭后由
+            // 窗口注册表退出。启动链接提交完成后若首个快照里已无待确认项，直接退出。
+            quit_when_nothing_to_confirm(launch_submissions, cx);
             return;
         }
         if launch.minimized {
-            // 自启动：等首个快照决定是「托盘驻留」还是「最小化主窗口」。
-            open_main_after_first_snapshot(cx);
+            // 开机自启（agent 判定需要界面时才拉起）：会话就绪后开最小化主窗口。
+            after_session_settled(cx, open_main_minimized);
             return;
         }
-        crate::windows::main::reveal(cx);
+        // 连接在 GPUI 初始化前已开始：热启动时首个快照几乎与事件循环同时到达，等它到了再开窗，
+        // 首帧就是完整数据、主题与语言，不闪「正在连接」；冷启动（需拉起后台）最多等连接宽限。
+        after_session_settled(cx, crate::windows::main::reveal);
     });
 
     Ok(RunOutcome::Completed)
@@ -365,33 +381,65 @@ fn start_windows_listener(
             )
         })?
 }
-/// `--minimized`：首个快照到达后按 `start_minimized_to_tray` 决定是否开主窗口。
-fn open_main_after_first_snapshot(cx: &mut App) {
+fn open_main_minimized(cx: &mut App) {
+    if let Some(handle) = crate::windows::main::open(cx) {
+        let _ = handle.update(cx, |_, window, _| window.minimize_window());
+    }
+}
+
+/// 会话已就绪（拿到快照或已确认离线）立即执行，否则等到就绪后执行一次。
+fn after_session_settled(cx: &mut App, run: fn(&mut App)) {
     let session = Desktop::global(cx).session.clone();
-    if Desktop::global(cx).session.read(cx).latest().is_some() {
-        open_main_minimized(cx);
+    if session.read(cx).is_settled() {
+        run(cx);
+        return;
+    }
+    let subscription = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let holder = std::rc::Rc::clone(&subscription);
+    *subscription.borrow_mut() = Some(cx.subscribe(&session, move |_, signal, cx| {
+        if matches!(
+            signal,
+            SessionSignal::Snapshot(_) | SessionSignal::Stale | SessionSignal::Fatal(_)
+        ) && holder.borrow_mut().take().is_some()
+        {
+            run(cx);
+        }
+    }));
+}
+
+/// `--capture`：启动链接提交完、首个快照也已派发确认窗口后仍没有任何窗口（请求已被别处处理
+/// 或已按默认值超时）时退出，避免留下无窗口、无托盘的界面进程。
+fn quit_when_nothing_to_confirm(submissions: tokio::sync::oneshot::Receiver<()>, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        let _ = submissions.await;
+        cx.update(|cx| {
+            after_first_snapshot(cx, |cx| {
+                cx.defer(|cx| {
+                    if WindowRegistry::open_count(cx) == 0 {
+                        crate::lifecycle::quit_ui(cx);
+                    }
+                });
+            });
+        });
+    })
+    .detach();
+}
+
+/// 已有快照立即执行，否则等首个快照到达后执行一次。
+fn after_first_snapshot(cx: &mut App, run: fn(&mut App)) {
+    let session = Desktop::global(cx).session.clone();
+    if session.read(cx).latest().is_some() {
+        run(cx);
         return;
     }
     let subscription = std::rc::Rc::new(std::cell::RefCell::new(None));
     let holder = std::rc::Rc::clone(&subscription);
     *subscription.borrow_mut() = Some(cx.subscribe(&session, move |_, signal, cx| {
         if matches!(signal, SessionSignal::Snapshot(_)) {
-            open_main_minimized(cx);
+            run(cx);
             holder.borrow_mut().take();
         }
     }));
-}
-
-fn open_main_minimized(cx: &mut App) {
-    let to_tray =
-        WindowRegistry::is_resident(cx) && Desktop::pref_bool(cx, "start_minimized_to_tray", false);
-    if to_tray {
-        crate::app_icon::set_dock_visible(false);
-        return;
-    }
-    if let Some(handle) = crate::windows::main::open(cx) {
-        let _ = handle.update(cx, |_, window, _| window.minimize_window());
-    }
 }
 
 /// 偏好快照 → 全局外观与语言。每次快照/偏好事件都幂等应用。
@@ -445,7 +493,7 @@ fn capture_calls(
 ) -> Vec<(String, crate::agent_client::AgentFuture<serde_json::Value>)> {
     let mut calls = Vec::with_capacity(urls.len() + files.len());
     for url in urls {
-        let url = launch::normalize_capture_url(&url);
+        let url = fluxdown_protocol::capture_link::normalize_capture_url(&url);
         let future = client.call::<serde_json::Value, serde_json::Value>(
             fluxdown_protocol::method::AGENT_CAPTURE_SUBMIT,
             Some(serde_json::json!({ "request": { "url": url }, "silent": true })),
@@ -463,14 +511,16 @@ fn capture_calls(
     calls
 }
 
-/// 主实例：不阻塞 UI 线程，在后台把链接交给 agent。
+/// 主实例：不阻塞 UI 线程，在后台把链接交给 agent；返回的接收端在全部提交结束后完成。
 pub(crate) fn submit_captures_detached(
     client: &Arc<AgentClient>,
     urls: Vec<String>,
     files: Vec<std::path::PathBuf>,
-) {
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (done, finished) = tokio::sync::oneshot::channel();
     if urls.is_empty() && files.is_empty() {
-        return;
+        let _ = done.send(());
+        return finished;
     }
     let calls = capture_calls(client, urls, files);
     client.spawn_background(async move {
@@ -479,7 +529,9 @@ pub(crate) fn submit_captures_detached(
                 eprintln!("failed to submit {source}: {:?}", error.code);
             }
         }
+        let _ = done.send(());
     });
+    finished
 }
 
 fn agent_token_path() -> std::path::PathBuf {
@@ -492,17 +544,6 @@ fn agent_token_path() -> std::path::PathBuf {
     directories::ProjectDirs::from("dev", "zerx", "FluxDown")
         .map(|project| project.data_dir().join("agent").join("agent.token"))
         .unwrap_or_else(|| std::path::PathBuf::from("agent.token"))
-}
-
-pub(crate) fn system_locale() -> String {
-    for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
-        if let Ok(locale) = env::var(key)
-            && !locale.trim().is_empty()
-        {
-            return locale;
-        }
-    }
-    "en".to_owned()
 }
 
 #[cfg(test)]

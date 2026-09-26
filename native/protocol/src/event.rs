@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{
     AgentPreferencesDto, AgentSessionDto, CloudDevice, GatewayStatusDto, PendingCaptureDto,
-    RemoteTaskDto, SyncStatusDto,
+    PowerStatusDto, RemoteTaskDto, ShellStatusDto, SyncStatusDto,
 };
 use crate::daemon::{
     ComponentStatusDto, DaemonConfigSnapshot, DaemonRuntimeStatsDto, GroupDto, LinkDeviceInfo,
@@ -52,6 +52,10 @@ pub struct AgentSnapshot {
     pub linked_devices: Vec<LinkDeviceInfo>,
     pub remote_tasks: Vec<RemoteTaskDto>,
     pub pending_captures: Vec<PendingCaptureDto>,
+    #[serde(default)]
+    pub shell: ShellStatusDto,
+    #[serde(default)]
+    pub power: PowerStatusDto,
 }
 
 /// `system.snapshot` 的服务角色对应主体。
@@ -129,6 +133,8 @@ pub enum AgentEvent {
     LinkedDevicesChanged(Vec<LinkDeviceInfo>),
     RemoteTasksChanged(Vec<RemoteTaskDto>),
     PendingCapturesChanged(Vec<PendingCaptureDto>),
+    ShellChanged(ShellStatusDto),
+    PowerChanged(PowerStatusDto),
 }
 
 /// `service.event` notification 的事件主体。
@@ -171,6 +177,8 @@ pub fn apply_agent_event(snapshot: &mut AgentSnapshot, event: &AgentEvent) {
         AgentEvent::PendingCapturesChanged(captures) => {
             snapshot.pending_captures.clone_from(captures)
         }
+        AgentEvent::ShellChanged(shell) => snapshot.shell.clone_from(shell),
+        AgentEvent::PowerChanged(power) => snapshot.power = *power,
     }
 }
 

@@ -119,6 +119,34 @@ fn daemon_process_enforces_wire_auth_conflict_body_limit_and_shutdown() {
     std::fs::remove_dir_all(&data_dir).expect("remove daemon test data dir");
 }
 
+/// 版本不兼容的新 agent 靠握手前 `system.shutdown` 替换旧 daemon：旧进程必须正常退出并
+/// 释放 data dir 租约，同一目录随即可以再起一个 daemon。
+#[test]
+fn pre_handshake_shutdown_exits_cleanly_and_releases_the_data_dir() {
+    let address = reserve_loopback_address();
+    let data_dir = unique_temp_dir("fluxdown-daemon-shutdown-contract");
+    std::fs::create_dir_all(&data_dir).expect("create daemon test data dir");
+    std::fs::write(data_dir.join("daemon.token"), format!("{TOKEN}\n"))
+        .expect("write daemon test token");
+
+    let mut daemon = ProcessGuard::spawn(address, &data_dir);
+    wait_until_listening(address, Duration::from_secs(30));
+    let mut socket = open_websocket(address, TOKEN);
+    let response = rpc_call(
+        &mut socket,
+        1,
+        fluxdown_protocol::method::SYSTEM_SHUTDOWN,
+        None,
+    );
+    assert_eq!(response["result"]["ok"], json!(true), "{response}");
+    daemon.wait_for_success(Duration::from_secs(30));
+
+    let mut successor = ProcessGuard::spawn(address, &data_dir);
+    wait_until_listening(address, Duration::from_secs(30));
+    successor.terminate(Duration::from_secs(10));
+    std::fs::remove_dir_all(&data_dir).expect("remove daemon test data dir");
+}
+
 struct ProcessGuard {
     child: Option<Child>,
 }

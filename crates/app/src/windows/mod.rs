@@ -1,7 +1,8 @@
-//! 窗口注册表与进程驻留态。
+//! 窗口注册表与界面进程退出判定。
 //!
-//! 所有顶层窗口按 [`WindowKey`] 去重；最后一个用户窗口关闭且非 Resident（托盘未安装）
-//! 时退出进程。gpui 不会在最后一个窗口关闭时自动退出，这里是唯一的退出判定点。
+//! 所有顶层窗口按 [`WindowKey`] 去重；最后一个用户窗口关闭时界面进程退出（后台是否驻留由
+//! agent 决定，见 `crate::lifecycle`）。gpui 不会在最后一个窗口关闭时自动退出，这里是唯一的
+//! 「关窗即退出」判定点。
 
 use std::{
     cell::{Cell, RefCell},
@@ -24,7 +25,6 @@ pub mod group_detail;
 pub mod main;
 pub mod new_download;
 pub mod queue_manager;
-pub mod quick_capture;
 pub mod selection;
 pub mod settings;
 pub mod task_detail;
@@ -36,7 +36,6 @@ pub enum WindowKey {
     Settings,
     NewDownload,
     QueueManager,
-    QuickCapture,
     Selection(String),
     TaskDetail(String),
     GroupDetail(String),
@@ -56,7 +55,6 @@ impl WindowKey {
 pub struct WindowRegistry {
     open: HashMap<WindowKey, AnyWindowHandle>,
     ids: HashMap<WindowId, WindowKey>,
-    resident: bool,
     /// 正在显示「下载仍在进行」确认框的窗口：重复 ⌘W / ⌘Q 不叠第二个对话框。
     confirming: HashSet<WindowId>,
     /// 防抖中尚未落盘的窗口边界（退出时强制写一次）。
@@ -71,23 +69,16 @@ impl WindowRegistry {
     /// 安装全局注册表：窗口关闭清理 + 退出判定 + 退出时落盘边界。
     pub fn init(cx: &mut App, client: Arc<AgentClient>) {
         let closed_sub = cx.on_window_closed(|cx, window_id| {
-            let (should_quit, hide_dock) = {
+            let last_closed = {
                 let registry = cx.global_mut::<Self>();
-                let key = registry.ids.remove(&window_id);
-                if let Some(key) = &key {
-                    registry.open.remove(key);
+                if let Some(key) = registry.ids.remove(&window_id) {
+                    registry.open.remove(&key);
                 }
                 registry.confirming.remove(&window_id);
-                (
-                    registry.should_quit(),
-                    registry.resident && key == Some(WindowKey::Main),
-                )
+                registry.open.is_empty()
             };
-            if should_quit {
-                cx.quit();
-            } else if hide_dock {
-                // 托盘驻留：主窗口关闭即从 Dock 隐藏，只从托盘唤回。
-                crate::app_icon::set_dock_visible(false);
+            if last_closed {
+                crate::lifecycle::quit_ui(cx);
             }
         });
         let pending_bounds = Rc::new(RefCell::new(HashMap::new()));
@@ -104,16 +95,11 @@ impl WindowRegistry {
         cx.set_global(Self {
             open: HashMap::new(),
             ids: HashMap::new(),
-            resident: false,
             confirming: HashSet::new(),
             pending_bounds,
             _closed_sub: closed_sub,
             _quit_sub: quit_sub,
         });
-    }
-
-    fn should_quit(&self) -> bool {
-        self.open.is_empty() && !self.resident
     }
 
     /// 打开或聚焦窗口。已开 → `activate_window` 并返回 `None`。
@@ -185,7 +171,7 @@ impl WindowRegistry {
     }
 
     /// 当前获得焦点的窗口。macOS 的 `cx.active_window()` 只认 `NSWindow`，`Floating` /
-    /// `PopUp` 是 `NSPanel`（选择框、快速捕获）会返回 `None`，此时按 gpui 记录的 key 态扫描。
+    /// `PopUp` 是 `NSPanel`（选择框）会返回 `None`，此时按 gpui 记录的 key 态扫描。
     /// 只能在 defer 之后调用：正在 update 栈内的窗口不在 `cx.windows` 里，扫描会漏掉它。
     #[must_use]
     pub fn focused_window(cx: &mut App) -> Option<AnyWindowHandle> {
@@ -215,23 +201,6 @@ impl WindowRegistry {
                 }
             });
         });
-    }
-
-    /// 托盘已安装 → 无窗口也不退出。变为 `false` 且无窗口 → 退出。
-    pub fn set_resident(cx: &mut App, resident: bool) {
-        let should_quit = {
-            let registry = cx.global_mut::<Self>();
-            registry.resident = resident;
-            registry.should_quit()
-        };
-        if should_quit {
-            cx.quit();
-        }
-    }
-
-    #[must_use]
-    pub fn is_resident(cx: &App) -> bool {
-        cx.global::<Self>().resident
     }
 
     /// 用户窗口数量。

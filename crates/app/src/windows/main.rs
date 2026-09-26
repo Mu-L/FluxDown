@@ -30,8 +30,6 @@ pub fn reveal(cx: &mut App) {
 
 /// 打开或聚焦主窗口。返回新建窗口句柄（已开时 `None`）。
 pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
-    // 关窗驻留托盘时 Dock 图标已隐藏；主窗口出现前恢复，保证激活后菜单栏与 Dock 就位。
-    crate::app_icon::set_dock_visible(true);
     let desktop = Desktop::global(cx);
     let translator = desktop.translator.clone();
     let session = desktop.session.clone();
@@ -177,16 +175,18 @@ fn install_close_policy(window: &mut Window, cx: &mut App) {
     window.on_window_should_close(cx, should_close);
 }
 
-/// 主窗口是否可立即关闭：托盘驻留 → 关；无活跃任务或还有其他窗口 → 关；否则弹
-/// 「下载仍在进行」确认框并返回 `false`（确认后由对话框自己关窗）。
+/// 主窗口关闭：agent 托盘驻留 → 只关窗（最后一个窗口关闭后界面进程退出，下载与队列在后台
+/// 继续）；否则等同「退出」——有活跃任务时先确认，随后完全退出（后台随界面一起停止）。
+/// 尚未收到首个快照时驻留策略未知，按只关窗处理，绝不误停后台。
 pub fn should_close(window: &mut Window, cx: &mut App) -> bool {
-    let close_to_tray = Desktop::pref_bool(cx, "close_to_tray", true);
-    if close_to_tray && WindowRegistry::is_resident(cx) {
+    let desktop = Desktop::global(cx);
+    if desktop.shell.resident || desktop.session.read(cx).latest().is_none() {
         return true;
     }
-    if Desktop::active_task_count(cx) == 0 || WindowRegistry::open_count(cx) > 1 {
-        return true;
+    if Desktop::active_task_count(cx) == 0 {
+        crate::lifecycle::quit_everything(cx);
+    } else {
+        confirm_active_tasks(window, cx, |_, cx| crate::lifecycle::quit_everything(cx));
     }
-    confirm_active_tasks(window, cx, |window, _| window.remove_window());
     false
 }

@@ -134,6 +134,29 @@ pub(crate) fn merge_imported(existing_text: &str, imported: Vec<UrlEntry>) -> St
         .join("\n")
 }
 
+/// 把条目追加到现有文本末尾：原文逐字保留（含注释 / 尚未输完的行），已存在的 URL
+/// 跳过。用于外部捕获陆续进入正在编辑的表单。
+pub(crate) fn append_entries(
+    existing_text: &str,
+    entries: impl IntoIterator<Item = UrlEntry>,
+) -> String {
+    let mut seen = parse_entries(existing_text, false)
+        .into_iter()
+        .map(|entry| entry.url)
+        .collect::<HashSet<_>>();
+    let mut text = existing_text.trim_end().to_owned();
+    for entry in entries {
+        if !seen.insert(entry.url.clone()) {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&entry_to_text(&entry));
+    }
+    text
+}
+
 /// 强制直连哨兵值。
 pub(crate) const PROXY_DIRECT_SENTINEL: &str = "direct://";
 /// 跟随系统代理哨兵值。
@@ -395,9 +418,45 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use super::{
-        DraftOptions, ProxyChoice, ThreadChoice, UrlEntry, build_requests, checksum_spec,
-        custom_segments, detect_ua_preset, manual_proxy_url, merge_imported, parse_entries,
+        DraftOptions, ProxyChoice, ThreadChoice, UrlEntry, append_entries, build_requests,
+        checksum_spec, custom_segments, detect_ua_preset, manual_proxy_url, merge_imported,
+        parse_entries,
     };
+
+    #[test]
+    fn append_entries_keeps_existing_text_verbatim_and_skips_known_urls() {
+        let existing = "# mine\nhttps://a.example/one.zip\nhttps://half-typ\n";
+        let text = append_entries(
+            existing,
+            [
+                UrlEntry {
+                    url: "https://a.example/one.zip".to_owned(),
+                    file_name: "dup.zip".to_owned(),
+                    ..UrlEntry::default()
+                },
+                UrlEntry {
+                    url: "https://b.example/two.bin".to_owned(),
+                    file_name: "two.bin".to_owned(),
+                    ..UrlEntry::default()
+                },
+            ],
+        );
+        assert_eq!(
+            text,
+            "# mine\nhttps://a.example/one.zip\nhttps://half-typ\nhttps://b.example/two.bin\n  out=two.bin"
+        );
+        assert_eq!(parse_entries(&text, false)[2].file_name, "two.bin");
+        assert_eq!(
+            append_entries(
+                "",
+                [UrlEntry {
+                    url: "https://c.example/x".to_owned(),
+                    ..UrlEntry::default()
+                }]
+            ),
+            "https://c.example/x"
+        );
+    }
 
     #[test]
     fn strict_parse_requires_url_at_line_start_and_attaches_options() {

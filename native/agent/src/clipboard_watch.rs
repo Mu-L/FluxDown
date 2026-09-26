@@ -1,108 +1,96 @@
 //! 剪贴板监听：`general.clipboard_watch` 打开时，检测复制的下载链接并提交给捕获队列
-//! （非静默 —— 会弹出快速捕获窗口供用户确认，而非直接静默建任务）。
+//! （非静默 —— 由官方 UI 在新建下载窗口确认；没有 UI 时 agent 按需拉起）。
+//!
+//! 归 agent 而不是界面：托盘驻留、界面全部关闭时仍要继续监听。
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use fluxdown_protocol::capture_link::{is_capture_url, normalize_capture_url};
 use fluxdown_protocol::method;
-use gpui::{App, Global};
+use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
-use crate::agent_client::AgentClient;
-use crate::app::Desktop;
-use crate::launch;
+use crate::event_hub::AgentEventHub;
+use crate::gateway::GatewayService;
 
-const POLL_INTERVAL: Duration = Duration::from_millis(1000);
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
+const PREFERENCE_KEY: &str = "general.clipboard_watch";
 
-struct ClipboardWatchState {
-    /// 上次读到的剪贴板文本，用于跳过未变化的内容（含启动时的基线，不触发提交）。
-    last_text: Option<String>,
-    seen: SeenUrls,
+/// 在专用线程上轮询剪贴板（各平台剪贴板 API 都是同步阻塞调用）。
+pub fn spawn(events: AgentEventHub, gateway: Arc<GatewayService>, cancel: CancellationToken) {
+    let runtime = tokio::runtime::Handle::current();
+    let spawned = std::thread::Builder::new()
+        .name("fluxdown-clipboard-watch".to_owned())
+        .spawn(move || watch(&events, &gateway, &cancel, &runtime));
+    if let Err(error) = spawned {
+        tracing::warn!(error = %error, "clipboard watcher thread unavailable");
+    }
 }
 
-impl Global for ClipboardWatchState {}
-
-/// 安装剪贴板监听。启动时先读一次剪贴板作为基线（不触发提交），随后每秒轮询一次；
-/// 是否实际检测取决于当次轮询时的 `general.clipboard_watch` 偏好值。
-pub fn install(cx: &mut App) {
-    if cx.has_global::<ClipboardWatchState>() {
-        return;
-    }
-    let baseline = cx.read_from_clipboard().and_then(|item| item.text());
-    cx.set_global(ClipboardWatchState {
-        last_text: baseline,
-        seen: SeenUrls::new(),
-    });
-    cx.spawn(async move |cx| {
-        loop {
-            cx.background_executor().timer(POLL_INTERVAL).await;
-            let mut alive = true;
-            cx.update(|cx| {
-                if !cx.has_global::<Desktop>() {
-                    alive = false;
-                    return;
-                }
-                tick(cx);
-            });
-            if !alive {
-                break;
-            }
+fn watch(
+    events: &AgentEventHub,
+    gateway: &Arc<GatewayService>,
+    cancel: &CancellationToken,
+    runtime: &tokio::runtime::Handle,
+) {
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(clipboard) => clipboard,
+        Err(error) => {
+            tracing::info!(error = %error, "clipboard unavailable; clipboard watch disabled");
+            return;
         }
-    })
-    .detach();
-}
-
-fn tick(cx: &mut App) {
-    if !Desktop::pref_bool(cx, "general.clipboard_watch", false) {
-        return;
-    }
-    let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-        return;
     };
-    {
-        let Some(state) = cx.try_global::<ClipboardWatchState>() else {
-            return;
+    // 启动时的剪贴板内容只作基线，不触发提交。
+    let mut last_text = clipboard.get_text().ok();
+    let mut seen = SeenUrls::new();
+    while !cancel.is_cancelled() {
+        std::thread::sleep(POLL_INTERVAL);
+        let enabled = events.inspect(|snapshot| {
+            snapshot
+                .preferences
+                .values
+                .get(PREFERENCE_KEY)
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        });
+        if !enabled {
+            continue;
+        }
+        let Ok(text) = clipboard.get_text() else {
+            continue;
         };
-        if state.last_text.as_deref() == Some(text.as_str()) {
-            return;
+        if last_text.as_deref() == Some(text.as_str()) {
+            continue;
+        }
+        let urls = extract_capture_urls(&text);
+        last_text = Some(text);
+        let now = Instant::now();
+        for url in urls {
+            let url = normalize_capture_url(&url);
+            if !seen.insert(&url, now) {
+                continue;
+            }
+            let gateway = Arc::clone(gateway);
+            runtime.spawn(async move {
+                let submitted = gateway
+                    .dispatch_local(
+                        method::AGENT_CAPTURE_SUBMIT,
+                        serde_json::json!({ "request": { "url": url }, "silent": false }),
+                    )
+                    .await;
+                if let Err(error) = submitted {
+                    tracing::warn!(code = ?error.code, "clipboard capture rejected");
+                }
+            });
         }
     }
-
-    let urls = extract_capture_urls(&text);
-    let now = Instant::now();
-    let state = cx.global_mut::<ClipboardWatchState>();
-    state.last_text = Some(text);
-    let mut to_submit = Vec::with_capacity(urls.len());
-    for url in urls {
-        let url = launch::normalize_capture_url(&url);
-        if state.seen.insert(&url, now) {
-            to_submit.push(url);
-        }
-    }
-    if to_submit.is_empty() {
-        return;
-    }
-
-    let client = Desktop::global(cx).client.clone();
-    for url in to_submit {
-        submit_capture(cx, &client, url);
-    }
-}
-
-fn submit_capture(cx: &mut App, client: &Arc<AgentClient>, url: String) {
-    let future = client.call::<serde_json::Value, serde_json::Value>(
-        method::AGENT_CAPTURE_SUBMIT,
-        Some(serde_json::json!({ "request": { "url": url }, "silent": false })),
-    );
-    cx.spawn(async move |_cx| {
-        let _ = future.await;
-    })
-    .detach();
 }
 
 /// 从剪贴板文本中提取可捕获的下载链接：整段是单个可捕获链接，或按行拆分后每一行都是
 /// 可捕获链接（逐行返回）；否则返回空。
-pub(crate) fn extract_capture_urls(text: &str) -> Vec<String> {
+fn extract_capture_urls(text: &str) -> Vec<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -113,19 +101,19 @@ pub(crate) fn extract_capture_urls(text: &str) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .collect();
     if lines.len() > 1 {
-        if lines.iter().all(|line| launch::is_capture_url(line)) {
+        if lines.iter().all(|line| is_capture_url(line)) {
             return lines.into_iter().map(str::to_owned).collect();
         }
         return Vec::new();
     }
-    if launch::is_capture_url(trimmed) {
+    if is_capture_url(trimmed) {
         return vec![trimmed.to_owned()];
     }
     Vec::new()
 }
 
 /// 最近提交过的 URL 集合：30 分钟内去重，最多保留 50 条（超出淘汰最旧的）。
-pub(crate) struct SeenUrls {
+struct SeenUrls {
     entries: VecDeque<(String, Instant)>,
 }
 
@@ -133,14 +121,14 @@ impl SeenUrls {
     const CAPACITY: usize = 50;
     const TTL: Duration = Duration::from_secs(30 * 60);
 
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             entries: VecDeque::new(),
         }
     }
 
     /// `url` 在 TTL 内已出现过则返回 `false`（去重命中）；否则记录并返回 `true`。
-    pub(crate) fn insert(&mut self, url: &str, now: Instant) -> bool {
+    fn insert(&mut self, url: &str, now: Instant) -> bool {
         self.entries
             .retain(|(_, seen_at)| now.saturating_duration_since(*seen_at) < Self::TTL);
         if self.entries.iter().any(|(seen, _)| seen == url) {

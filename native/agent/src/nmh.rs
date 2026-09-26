@@ -1151,7 +1151,6 @@ pub mod registry {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
 
     use serde_json::json;
 
@@ -1164,10 +1163,17 @@ mod tests {
         let daemon = Arc::new(crate::daemon_client::DaemonClient::disconnected());
         let events =
             crate::event_hub::AgentEventHub::new(fluxdown_protocol::AgentSnapshot::default());
+        let shell = crate::shell::ShellState::new(
+            crate::shell::TrayAvailability::Unavailable(
+                fluxdown_protocol::TrayUnavailableReason::NotBuilt,
+            ),
+            daemon.clone(),
+            events.clone(),
+        );
         let capture = Arc::new(crate::capture::CaptureService::new(
             daemon.clone(),
             events,
-            Arc::new(AtomicUsize::new(0)),
+            shell,
         ));
         let service = NmhService::new(daemon, capture);
         let (client, server) = tokio::io::duplex(4096);

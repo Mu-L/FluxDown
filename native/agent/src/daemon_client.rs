@@ -171,6 +171,8 @@ async fn run_client(
 ) {
     let backoff = [1_u64, 2, 5, 15, 30];
     let mut attempt = 0_usize;
+    // 每个 agent 进程只尝试替换一次协议不兼容的 daemon，避免同目录二进制错配时反复互杀。
+    let mut replaced_incompatible = false;
     loop {
         match connect(&config).await {
             Ok((socket, snapshot, buffered)) => {
@@ -200,6 +202,32 @@ async fn run_client(
                     tracing::warn!(error = %error, "could not supervise fluxdownd");
                 }
             }
+            Err(ConnectError::Incompatible) if !replaced_incompatible => {
+                replaced_incompatible = true;
+                match request_shutdown(&config).await {
+                    Ok(()) => {
+                        tracing::info!("asked protocol-incompatible fluxdownd to exit");
+                        wait_until_stopped(&config, Duration::from_secs(30)).await;
+                        attempt = 0;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "protocol-incompatible fluxdownd refused shutdown");
+                        let _ = events
+                            .send(DaemonClientEvent::Fatal(protocol_error()))
+                            .await;
+                        connected.store(false, Ordering::Release);
+                        return;
+                    }
+                }
+            }
+            Err(ConnectError::Incompatible) => {
+                let _ = events
+                    .send(DaemonClientEvent::Fatal(protocol_error()))
+                    .await;
+                connected.store(false, Ordering::Release);
+                return;
+            }
             Err(ConnectError::Fatal(error)) => {
                 let _ = events.send(DaemonClientEvent::Fatal(error)).await;
                 connected.store(false, Ordering::Release);
@@ -222,9 +250,7 @@ fn fail_queued_commands(commands: &mut mpsc::Receiver<ClientCommand>) {
     }
 }
 
-async fn connect(
-    config: &DaemonClientConfig,
-) -> Result<(Socket, Snapshot, Vec<EventFrame>), ConnectError> {
+async fn open_socket(config: &DaemonClientConfig) -> Result<Socket, ConnectError> {
     let mut request = config
         .rpc_url
         .clone()
@@ -235,9 +261,53 @@ async fn connect(
     request
         .headers_mut()
         .insert(header::AUTHORIZATION, authorization);
-    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+    let (socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(classify_connect_error)?;
+    Ok(socket)
+}
+
+/// 握手前 `system.shutdown`：只有支持该首帧的 daemon（v4 起）会受理。
+async fn request_shutdown(config: &DaemonClientConfig) -> Result<(), String> {
+    let mut socket = open_socket(config)
+        .await
+        .map_err(|_| "daemon unreachable".to_owned())?;
+    let mut buffered = Vec::new();
+    call_on_socket(&mut socket, 1, method::SYSTEM_SHUTDOWN, None, &mut buffered)
+        .await
+        .map(|_| ())
+        .map_err(|error| match error {
+            ConnectError::Fatal(data) => format!("{:?}", data.code),
+            ConnectError::Transient(message) => message,
+            ConnectError::Refused | ConnectError::Incompatible => "daemon unreachable".to_owned(),
+        })
+}
+
+/// 等旧 daemon 关闭监听（连接被拒）；超时后交回重连循环自愈。
+async fn wait_until_stopped(config: &DaemonClientConfig, timeout: Duration) {
+    let Ok(url) = reqwest::Url::parse(&config.rpc_url) else {
+        return;
+    };
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        match TcpStream::connect((host.as_str(), port)).await {
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return,
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+async fn connect(
+    config: &DaemonClientConfig,
+) -> Result<(Socket, Snapshot, Vec<EventFrame>), ConnectError> {
+    let mut socket = open_socket(config).await?;
     let mut buffered = Vec::new();
     let hello = serde_json::json!({
         "clientName": "fluxdown-agent",
@@ -254,13 +324,20 @@ async fn connect(
         Some(hello),
         &mut buffered,
     )
-    .await?;
+    .await
+    .map_err(|error| match error {
+        ConnectError::Fatal(data) if data.code == ApplicationErrorCode::ProtocolIncompatible => {
+            ConnectError::Incompatible
+        }
+        other => other,
+    })?;
     let service = serde_json::from_value::<ServiceHello>(hello_value)
         .map_err(|_| ConnectError::Fatal(protocol_error()))?;
-    if service.role != ServiceRole::Daemon
-        || service.protocol_version != fluxdown_protocol::PROTOCOL_VERSION
-    {
+    if service.role != ServiceRole::Daemon {
         return Err(ConnectError::Fatal(protocol_error()));
+    }
+    if service.protocol_version != fluxdown_protocol::PROTOCOL_VERSION {
+        return Err(ConnectError::Incompatible);
     }
     let snapshot_value =
         call_on_socket(&mut socket, 2, method::SYSTEM_SNAPSHOT, None, &mut buffered).await?;
@@ -429,6 +506,8 @@ fn classify_connect_error(error: tokio_tungstenite::tungstenite::Error) -> Conne
 enum ConnectError {
     Refused,
     Transient(String),
+    /// 对端协议版本不兼容：可尝试让旧进程退出后由监管拉起同版本 daemon。
+    Incompatible,
     Fatal(RpcErrorData),
 }
 

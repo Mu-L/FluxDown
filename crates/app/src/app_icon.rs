@@ -31,15 +31,6 @@ pub fn install() {
     macos::install_dock_icon();
 }
 
-/// macOS：切换 Dock 图标可见性（`Regular` ↔ `Accessory` 激活策略）。托盘驻留且主窗口关闭时
-/// 隐藏，只留菜单栏托盘；主窗口重新打开前恢复。其他平台空操作。
-pub fn set_dock_visible(visible: bool) {
-    #[cfg(target_os = "macos")]
-    macos::set_dock_visible(visible);
-    #[cfg(not(target_os = "macos"))]
-    let _ = visible;
-}
-
 #[cfg(target_os = "linux")]
 mod linux {
     use std::sync::{Arc, LazyLock};
@@ -65,9 +56,7 @@ mod linux {
 #[cfg(target_os = "macos")]
 mod macos {
     use objc2::{AnyThread as _, MainThreadMarker, MainThreadOnly as _};
-    use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSImage, NSImageScaling, NSImageView,
-    };
+    use objc2_app_kit::{NSApplication, NSImage, NSImageScaling, NSImageView};
     use objc2_foundation::{NSData, NSPoint, NSRect};
 
     /// macOS 风格（圆角 + 留白）的 Dock 素材，与 Flutter 壳 `AppIcon.appiconset` 同源。
@@ -101,25 +90,5 @@ mod macos {
         view.setImage(Some(&image));
         dock_tile.setContentView(Some(&view));
         dock_tile.display();
-    }
-
-    pub(super) fn set_dock_visible(visible: bool) {
-        let Some(mtm) = MainThreadMarker::new() else {
-            return;
-        };
-        let app = NSApplication::sharedApplication(mtm);
-        let policy = if visible {
-            NSApplicationActivationPolicy::Regular
-        } else {
-            NSApplicationActivationPolicy::Accessory
-        };
-        if app.activationPolicy() == policy {
-            return;
-        }
-        app.setActivationPolicy(policy);
-        if visible {
-            // 切回 Regular 后 Dock 重建图块，裸二进制需重新挂上自定义图标。
-            install_dock_icon();
-        }
     }
 }

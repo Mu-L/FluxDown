@@ -7,10 +7,12 @@ use crate::error::{ApplicationErrorCode, RpcErrorData, RpcErrorObject};
 
 /// JSON-RPC wire 版本。
 pub const JSONRPC_VERSION: &str = "2.0";
-/// 当前本机服务协议版本；v3 增加严格枚举的任务运行态与持久活动事件。
-pub const PROTOCOL_VERSION: u32 = 3;
-/// v2 客户端不能解析新增事件，必须在握手时拒绝混用而非运行中断连。
-pub const MIN_PROTOCOL_VERSION: u32 = 3;
+/// 当前本机服务协议版本；v4 增加托盘驻留（`ShellChanged`）与完成后关机（`PowerChanged`）事件。
+pub const PROTOCOL_VERSION: u32 = 4;
+/// v3 客户端不能解析新增事件，必须在握手时拒绝混用而非运行中断连。
+pub const MIN_PROTOCOL_VERSION: u32 = 4;
+/// 服务收到 `system.shutdown` 而退出时的 WebSocket 关闭原因：客户端据此停止重连与重拉。
+pub const CLOSE_REASON_SERVICE_QUIT: &str = "service-quit";
 
 /// 本机服务在 FluxDown 架构中的职责。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -309,7 +311,7 @@ mod tests {
                 "role": "agent",
                 "serviceName": "fluxdown-agent",
                 "serviceVersion": "1.0.0",
-                "protocolVersion": 3,
+                "protocolVersion": 4,
                 "instanceId": "instance-1",
                 "capabilities": ["agent.gateway"]
             })
@@ -322,14 +324,14 @@ mod tests {
         let client = ClientHello {
             client_name: "old-client".to_owned(),
             client_version: "0.1.0".to_owned(),
-            min_protocol_version: 2,
-            max_protocol_version: 2,
+            min_protocol_version: 3,
+            max_protocol_version: 3,
             requested_role: ServiceRole::Daemon,
             capabilities: Vec::new(),
         };
 
         let error = match negotiate_protocol(&client) {
-            Ok(version) => panic!("v2 unexpectedly negotiated protocol {version}"),
+            Ok(version) => panic!("v3 unexpectedly negotiated protocol {version}"),
             Err(error) => error,
         };
         assert_eq!(error.code, ApplicationErrorCode::ProtocolIncompatible);

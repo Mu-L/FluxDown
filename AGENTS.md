@@ -115,7 +115,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 | `ApiHost` | `native/api/src/service.rs` | 客户端→引擎（HTTP 契约） | REST/aria2/MCP 的能力面；必需方法 + 可默认降级方法 |
 
 - 当前两个生产宿主仍是 `hub`（App，actor=`download_actor.rs`）与 `server`（headless，actor=`actor.rs`）；`fluxdown_api` 只依赖 `&dyn ApiHost`，同一套 HTTP 面服务任意宿主。CLI 双模式：默认 HTTP 连宿主，`add --local` 内嵌引擎。
-- **迁移目标**：`native/daemon` 成为可独立运行的纯下载核心，`native/agent` 常驻承载账户/云同步/设备协同与官方 UI Gateway；两者共享 `native/protocol` 的 JSON-RPC 语义。`native/server` 进入废弃路径，任何新实现不得依赖它。
+- **迁移目标**：`native/daemon` 成为可独立运行的纯下载核心，`native/agent` 常驻承载账户/云同步/设备协同、官方 UI Gateway 与系统外壳（托盘、关闭 UI 后的驻留策略；GPUI 界面进程本身不驻留）；两者共享 `native/protocol` 的 JSON-RPC 语义。`native/server` 进入废弃路径，任何新实现不得依赖它。
 - **并发模型**：current_thread tokio actor 串行化写；每个下载 spawn 独立 task + CancellationToken；插件 resolve 永不阻塞 actor（off-actor spawn + 通道回流）。
 - 客户端捕获三条并行前端进同一本机 RPC（`:17800/download`）：扩展、用户脚本、桌面确认框。
 

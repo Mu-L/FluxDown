@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
@@ -12,8 +11,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use fluxdown_protocol::method;
 use fluxdown_protocol::{
-    ApplicationErrorCode, RpcErrorData, RpcErrorObject, RpcNotification, RpcRequest, RpcResponse,
-    ServiceHello, ServiceRole, validate_first_request,
+    ApplicationErrorCode, CLOSE_REASON_SERVICE_QUIT, RpcErrorData, RpcErrorObject, RpcNotification,
+    RpcRequest, RpcResponse, ServiceHello, ServiceRole, validate_first_request,
 };
 use futures_util::StreamExt;
 use reqwest::Method;
@@ -27,13 +26,23 @@ use crate::cloud::{CloudApi, CloudAuthService, CloudError};
 use crate::daemon_client::DaemonClient;
 use crate::diagnostics::{DiagnosticsError, DiagnosticsService};
 use crate::event_hub::AgentEventHub;
+use crate::lifecycle::Lifecycle;
 use crate::platform::PlatformError;
+use crate::power::PowerService;
 use crate::remote::{RemoteError, RemoteTaskService};
+use crate::shell::ShellState;
 use crate::sync::SyncService;
 use crate::update::{UpdateError, UpdateService};
 
 /// daemon `/blobs/*` 请求体上限（与 `fluxdown_daemon::http::REQUEST_BODY_LIMIT` 一致）。
 const BLOB_UPLOAD_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// 网关依赖的本机外壳服务：UI 在线计数 / 驻留、完成后关机、进程生命周期。
+pub struct GatewayShell {
+    pub shell: Arc<ShellState>,
+    pub power: Arc<PowerService>,
+    pub lifecycle: Arc<Lifecycle>,
+}
 
 pub struct GatewayService {
     daemon: Arc<DaemonClient>,
@@ -51,9 +60,7 @@ pub struct GatewayService {
     api_switches: Arc<fluxdown_api::server::ApiRuntimeSwitches>,
     api_token: fluxdown_api::auth::TokenCell,
     hello: ServiceHello,
-    /// 已连接并声明 `client.selections` 能力的 UI 客户端数量；与 `CaptureService` 共享
-    /// 同一个 `Arc`，用于决定无 UI 时是否需要为捕获拉起桌面程序。
-    selection_clients: Arc<AtomicUsize>,
+    local: GatewayShell,
 }
 
 impl GatewayService {
@@ -77,7 +84,7 @@ impl GatewayService {
         store: Arc<crate::state::StateStore>,
         api_switches: Arc<fluxdown_api::server::ApiRuntimeSwitches>,
         api_token: fluxdown_api::auth::TokenCell,
-        selection_clients: Arc<AtomicUsize>,
+        local: GatewayShell,
     ) -> Self {
         Self {
             daemon,
@@ -107,7 +114,7 @@ impl GatewayService {
                     method::CAPABILITY_AGENT_DEVICE_LINK.to_owned(),
                 ],
             ),
-            selection_clients,
+            local,
         }
     }
 
@@ -121,11 +128,41 @@ impl GatewayService {
         }
     }
 
+    /// agent 内部组件（托盘、剪贴板监听）复用与 UI 相同的 RPC 分发入口。
+    pub async fn dispatch_local(
+        &self,
+        method_name: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcErrorData> {
+        self.dispatch(RpcRequest::new(
+            fluxdown_protocol::RequestId::String("agent-local".to_owned()),
+            method_name,
+            Some(params),
+        ))
+        .await
+    }
+
     async fn dispatch(&self, request: RpcRequest) -> Result<serde_json::Value, RpcErrorData> {
         match request.method.as_str() {
             method::SYSTEM_PING => Ok(serde_json::json!({ "ok": true })),
             method::SYSTEM_SNAPSHOT => serde_json::to_value(self.events.snapshot())
                 .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false)),
+            method::SYSTEM_SHUTDOWN => {
+                self.local.lifecycle.request_quit();
+                Ok(serde_json::json!({ "ok": true }))
+            }
+            method::AGENT_POWER_ARM => {
+                let params = parse_params::<fluxdown_protocol::PowerArmParams>(request.params)?;
+                let armed = self
+                    .local
+                    .power
+                    .arm(std::time::Duration::from_secs(params.delay_secs));
+                Ok(serde_json::json!({ "armed": armed }))
+            }
+            method::AGENT_POWER_DISARM => {
+                self.local.power.disarm();
+                Ok(serde_json::json!({ "ok": true }))
+            }
             method::AGENT_SESSION_GET => {
                 let snapshot = self.events.snapshot();
                 let session = match snapshot.body {
@@ -644,7 +681,7 @@ impl GatewayService {
             .map_err(|_| RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false))?;
         capture_value(
             self.capture
-                .resolve(&params.transaction_id, params.accepted, params.overrides)
+                .resolve(&params.transaction_id, params.accepted, params.request)
                 .await,
         )
     }
@@ -804,34 +841,12 @@ impl GatewayService {
         )
     }
 
-    async fn add_selection_client(&self) {
-        if self.selection_clients.fetch_add(1, Ordering::AcqRel) == 0 {
-            let _ = self
-                .daemon
-                .call::<serde_json::Value, serde_json::Value>(
-                    method::DAEMON_SELECTION_SUBSCRIBE,
-                    Some(serde_json::json!({})),
-                )
-                .await;
-        }
+    async fn ui_connected(&self) {
+        self.local.shell.ui_connected().await;
     }
 
-    async fn remove_selection_client(&self) {
-        let previous = self
-            .selection_clients
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                Some(count.saturating_sub(1))
-            })
-            .unwrap_or(0);
-        if previous == 1 {
-            let _ = self
-                .daemon
-                .call::<serde_json::Value, serde_json::Value>(
-                    method::DAEMON_SELECTION_UNSUBSCRIBE,
-                    Some(serde_json::json!({})),
-                )
-                .await;
-        }
+    async fn ui_disconnected(&self) {
+        self.local.shell.ui_disconnected().await;
     }
 }
 
@@ -1177,14 +1192,20 @@ async fn run_socket(
     cancel: CancellationToken,
 ) {
     let mut ready = false;
-    let mut selection_client = false;
+    let mut ui_client = false;
     let mut events = None;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
+                // 完全退出时客户端必须停止重连 / 重拉；仅 agent 退出（SIGTERM）时允许重拉。
+                let reason = if service.local.lifecycle.quit_requested() {
+                    CLOSE_REASON_SERVICE_QUIT
+                } else {
+                    "agent-shutdown"
+                };
                 let _ = socket.send(Message::Close(Some(CloseFrame {
                     code: 1001,
-                    reason: "agent-shutdown".into(),
+                    reason: reason.into(),
                 }))).await;
                 break;
             }
@@ -1198,13 +1219,20 @@ async fn run_socket(
                         continue;
                     }
                 };
+                if !ready && request.method == method::SYSTEM_SHUTDOWN && request.validate().is_ok() {
+                    // 握手前也受理：协议版本不兼容的新桌面程序靠它替换旧 agent。
+                    let response = RpcResponse::success(request.id, serde_json::json!({ "ok": true }));
+                    let _ = send_response(&mut socket, response).await;
+                    service.local.lifecycle.request_quit();
+                    continue;
+                }
                 if !ready {
                     let id = request.id.clone();
                     match validate_first_request(&request, ServiceRole::Agent) {
                         Ok(hello) => {
                             ready = true;
-                            selection_client = hello.capabilities.iter().any(|capability| capability == method::CAPABILITY_CLIENT_SELECTIONS);
-                            if selection_client { service.add_selection_client().await; }
+                            ui_client = hello.capabilities.iter().any(|capability| capability == method::CAPABILITY_CLIENT_SELECTIONS);
+                            if ui_client { service.ui_connected().await; }
                             let (receiver, _) = service.events.subscribe_and_snapshot();
                             events = Some(receiver);
                             let result = match serde_json::to_value(&service.hello) {
@@ -1239,8 +1267,8 @@ async fn run_socket(
             }
         }
     }
-    if selection_client {
-        service.remove_selection_client().await;
+    if ui_client {
+        service.ui_disconnected().await;
     }
 }
 
@@ -1296,7 +1324,6 @@ fn temporary_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use axum::http::{HeaderMap, HeaderValue, header};
@@ -1304,7 +1331,7 @@ mod tests {
         AgentSnapshot, ApplicationErrorCode, RequestId, RpcRequest, RpcResponse,
     };
 
-    use super::{GatewayService, authorized, load_or_create_bearer};
+    use super::{GatewayService, GatewayShell, authorized, load_or_create_bearer};
     #[tokio::test]
     async fn service_bearer_is_exact_stable_and_private() {
         let dir = std::env::temp_dir().join(format!(
@@ -1389,12 +1416,30 @@ mod tests {
                 state.clone(),
                 store.clone(),
             ));
-            let selection_clients = Arc::new(AtomicUsize::new(0));
+            let shell = crate::shell::ShellState::new(
+                crate::shell::TrayAvailability::Unavailable(
+                    fluxdown_protocol::TrayUnavailableReason::NotBuilt,
+                ),
+                daemon.clone(),
+                events.clone(),
+            );
             let capture = Arc::new(crate::capture::CaptureService::new(
                 daemon.clone(),
                 events.clone(),
-                selection_clients.clone(),
+                shell.clone(),
             ));
+            let local = GatewayShell {
+                shell,
+                power: Arc::new(crate::power::PowerService::new(events.clone())),
+                lifecycle: Arc::new(crate::lifecycle::Lifecycle::new(
+                    tokio_util::sync::CancellationToken::new(),
+                    daemon.clone(),
+                    Arc::new(crate::supervisor::DaemonSupervisor::new(
+                        "127.0.0.1:9".parse().expect("test daemon address"),
+                    )),
+                    dir.clone(),
+                )),
+            };
             let daemon_config = crate::daemon_client::DaemonClientConfig {
                 rpc_url: "ws://127.0.0.1:9/rpc".to_owned(),
                 bearer: String::new(),
@@ -1432,7 +1477,7 @@ mod tests {
                 store.clone(),
                 api_switches,
                 fluxdown_api::auth::TokenCell::new(""),
-                selection_clients,
+                local,
             );
             Self {
                 service,

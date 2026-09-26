@@ -119,8 +119,12 @@ pub enum DownloadsCommand {
         delete_files: bool,
     },
     ResolveSelection(fluxdown_protocol::SelectionResolutionDto),
-    /// 外部捕获确认 / 忽略（可覆盖保存目录、文件名、队列）。
-    CaptureResolve(fluxdown_protocol::CaptureResolveParams),
+    /// 外部捕获确认 / 忽略；确认时携带表单产出的建任务参数，由 agent 与捕获原请求合并。
+    CaptureResolve(Box<fluxdown_protocol::CaptureResolveParams>),
+    /// 按下载链接匹配已保存的站点 HTTP 凭据（新建下载表单自动回填）。
+    SiteAuthMatch {
+        url: String,
+    },
     RemoteDispatch(serde_json::Value),
     RemoteCommand(serde_json::Value),
     OpenTask {
@@ -374,19 +378,16 @@ impl DownloadsController {
         self.config.get(key).map_or("", |value| value.trim())
     }
 
-    /// 当前生效的保存目录：配置 `default_save_dir`，为空时回退 daemon 运行时目录。
-    #[must_use]
-    pub(crate) fn effective_save_dir(&self) -> &str {
-        match self.config_str("default_save_dir") {
-            "" => &self.runtime_stats.save_dir,
-            configured => configured,
-        }
-    }
-
     /// agent 偏好值。
     #[must_use]
     pub(crate) fn preference(&self, key: &str) -> Option<&serde_json::Value> {
         self.preferences.get(key)
+    }
+
+    /// 全部 agent 偏好。
+    #[must_use]
+    pub(crate) fn preferences(&self) -> &BTreeMap<String, serde_json::Value> {
+        &self.preferences
     }
 
     #[must_use]

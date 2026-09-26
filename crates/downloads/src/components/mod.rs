@@ -1,4 +1,3 @@
-pub(crate) mod dir_picker;
 pub(crate) mod segment_progress;
 pub(crate) mod selection_bar;
 pub(crate) mod sidebar;

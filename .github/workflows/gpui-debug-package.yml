@@ -144,11 +144,14 @@ jobs:
             echo "::warning::secrets.FLUXCLOUD_BASE_URL 未配置，agent 默认连接 http://127.0.0.1:8720"
           fi
 
+      # agent 带 desktop feature：托盘（tao + tray-icon）与剪贴板监听；Linux 运行期需要
+      # GTK3 与 (ayatana-)appindicator，构建依赖已在上方安装。
       - name: Build desktop, agent and daemon
         shell: bash
         run: |
           cargo build --locked --release --target ${{ matrix.target }} \
-            -p fluxdown_ui_app -p fluxdown_agent -p fluxdown_daemon --bins
+            -p fluxdown_ui_app -p fluxdown_agent -p fluxdown_daemon \
+            --features fluxdown_agent/desktop --bins
 
       - name: Stage package directory
         id: stage

@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -10,7 +11,7 @@ use axum::extract::{Path as AxumPath, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use fluxdown_protocol::{EventFrame, RpcNotification};
+use fluxdown_protocol::{CLOSE_REASON_SERVICE_QUIT, EventFrame, RpcNotification};
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -29,6 +30,8 @@ struct HttpState {
     service: Arc<DaemonService>,
     bearer: Arc<str>,
     cancel: CancellationToken,
+    /// 由 `system.shutdown` 触发的退出：各连接以 [`CLOSE_REASON_SERVICE_QUIT`] 关闭。
+    quit_requested: Arc<AtomicBool>,
 }
 
 /// 启动 daemon HTTP 服务直到取消或 listener 失败。
@@ -42,6 +45,7 @@ pub async fn serve(
         service,
         bearer: Arc::from(bearer),
         cancel: cancel.clone(),
+        quit_requested: Arc::new(AtomicBool::new(false)),
     };
     let app = Router::new()
         .route("/rpc", get(rpc_upgrade))
@@ -96,10 +100,8 @@ async fn rpc_upgrade(
     if !authorized(&headers, &state.bearer) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let service = state.service;
-    let cancel = state.cancel;
     upgrade
-        .on_upgrade(move |socket| run_socket(socket, service, cancel))
+        .on_upgrade(move |socket| run_socket(socket, state))
         .into_response()
 }
 
@@ -204,15 +206,26 @@ async fn download_export(
     (StatusCode::OK, bytes).into_response()
 }
 
-async fn run_socket(mut socket: WebSocket, service: Arc<DaemonService>, cancel: CancellationToken) {
+async fn run_socket(mut socket: WebSocket, state: HttpState) {
+    let HttpState {
+        service,
+        cancel,
+        quit_requested,
+        ..
+    } = state;
     let mut session = RpcSession::new(service.clone());
     let mut events = None;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
+                let reason = if quit_requested.load(Ordering::Acquire) {
+                    CLOSE_REASON_SERVICE_QUIT
+                } else {
+                    "daemon-shutdown"
+                };
                 let _ = socket.send(Message::Close(Some(CloseFrame {
                     code: 1001,
-                    reason: "daemon-shutdown".into(),
+                    reason: reason.into(),
                 }))).await;
                 break;
             }
@@ -227,6 +240,10 @@ async fn run_socket(mut socket: WebSocket, service: Arc<DaemonService>, cancel: 
                         }
                         let Ok(json) = serde_json::to_string(&reply.response) else { break; };
                         if socket.send(Message::Text(json.into())).await.is_err() { break; }
+                        if reply.shutdown_requested {
+                            quit_requested.store(true, Ordering::Release);
+                            cancel.cancel();
+                        }
                     }
                     Message::Close(_) => break,
                     Message::Ping(payload) => {

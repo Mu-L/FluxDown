@@ -1,33 +1,20 @@
 //! `fluxdown-agent` 官方客户端常驻后端。
+// 发布构建由开机自启直接拉起：GUI 子系统，登录时不弹控制台窗口。
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use tokio_util::sync::CancellationToken;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cancel = CancellationToken::new();
-    let signal_cancel = cancel.clone();
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        signal_cancel.cancel();
-    });
-    fluxdown_agent::runtime::run(cancel).await
-}
-
-#[cfg(unix)]
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let Ok(mut terminate) = signal(SignalKind::terminate()) else {
-        let _ = tokio::signal::ctrl_c().await;
-        return;
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = terminate.recv() => {}
+fn main() -> fluxdown_agent::runtime::AgentResult {
+    let autostart = std::env::args()
+        .skip(1)
+        .any(|arg| arg == fluxdown_agent::platform::AUTOSTART_ARG);
+    #[cfg(feature = "desktop")]
+    {
+        fluxdown_agent::shell::host::run(autostart, fluxdown_agent::runtime::run_blocking)
     }
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(not(feature = "desktop"))]
+    {
+        fluxdown_agent::runtime::run_blocking(fluxdown_agent::shell::ShellHost::without_tray(
+            fluxdown_protocol::TrayUnavailableReason::NotBuilt,
+            autostart,
+        ))
+    }
 }

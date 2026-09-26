@@ -19,17 +19,13 @@ use crate::{
         task_table::{DownloadTableDelegate, SelectionSummary, TableFilter, ToolbarCommand},
         title_bar::DownloadTitleBar,
     },
-    controller::{
-        DownloadsCommand, DownloadsController, DownloadsPort, LAST_SAVE_DIR_PREF,
-        REMEMBER_LAST_SAVE_DIR_PREF,
-    },
+    controller::{DownloadsCommand, DownloadsController, DownloadsPort},
     model::{
         DownloadFilter, DownloadStatusFilter, RowKey, SidebarSection, SidebarSelection,
         StatusFolderMotion, TaskState,
-        new_download::manual_proxy_url,
         view_prefs::{DetailPlacement, VIEW_PREFS_KEY, ViewGroupBy, ViewPrefs},
     },
-    pages::new_download::{NewDownloadContext, NewDownloadQueue, NewDownloadSubmission},
+    pages::new_download::{NewDownloadContext, NewDownloadSubmission, build_new_download_context},
     pages::task_detail::TaskDetailView,
     strings::DownloadStrings,
 };
@@ -220,67 +216,28 @@ impl DownloadView {
         cx.new(|cx| DownloadTitleBar::new(&view, translator, search_input, table_state, cx))
     }
 
-    /// 「新建下载」表单的环境快照：保存目录 / 默认队列 / 线程数初值与队列候选。
-    ///
-    /// 与 Dart 一致：偏好 `remember_last_save_dir` 开启且有记录时沿用上次目录，
-    /// 否则用全局默认；队列优先侧栏当前筛选，其次配置 `default_queue_id`，
-    /// 最后主队列；线程数优先队列 `default_segments`，其次全局配置。
+    /// 「新建下载」表单的环境快照：保存目录 / 默认队列 / 线程数初值与队列候选；
+    /// 队列优先侧栏当前筛选（规则见 [`build_new_download_context`]）。
     #[must_use]
     pub fn new_download_context(&self) -> NewDownloadContext {
         let controller = &self.controller;
-        let remember = controller.preference_bool(REMEMBER_LAST_SAVE_DIR_PREF, false);
-        let last_save_dir = controller
-            .preference(LAST_SAVE_DIR_PREF)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let save_dir = if remember && !last_save_dir.is_empty() {
-            last_save_dir
-        } else {
-            controller.effective_save_dir()
+        let selected_queue = match &self.selected_item {
+            SidebarSelection::Queue(queue_id) => Some(queue_id.as_str()),
+            _ => None,
         };
-        let queue_id = match &self.selected_item {
-            SidebarSelection::Queue(queue_id) => queue_id.as_str(),
-            _ => match controller.config_str("default_queue_id") {
-                "" => fluxdown_protocol::MAIN_QUEUE_ID,
-                configured => configured,
-            },
-        };
-        let queue_segments = controller
-            .queues()
-            .iter()
-            .find(|queue| queue.queue_id == queue_id)
-            .map_or(0, |queue| queue.default_segments);
-        let segments = if queue_segments > 0 {
-            queue_segments
-        } else {
-            controller
-                .config_str("default_segments")
-                .parse::<i32>()
-                .unwrap_or(0)
-        };
-        NewDownloadContext {
-            save_dir: save_dir.to_owned(),
-            queue_id: queue_id.to_owned(),
-            segments,
-            queues: controller
-                .queues()
-                .iter()
-                .map(|queue| NewDownloadQueue {
-                    id: queue.queue_id.clone(),
-                    name: queue.name.clone(),
-                })
-                .collect(),
-            manual_proxy_url: manual_proxy_url(controller.config()),
-            initial_urls: Vec::new(),
-            initial_file_name: String::new(),
-        }
+        build_new_download_context(
+            controller.config(),
+            &controller.runtime_stats().save_dir,
+            controller.preferences(),
+            controller.queues(),
+            selected_queue,
+        )
     }
 
     /// 打开「新建下载」窗口（可预填链接）。
     pub(crate) fn open_new_download_with(
         &self,
         initial_urls: Vec<String>,
-        initial_file_name: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -289,19 +246,17 @@ impl DownloadView {
         };
         let mut context = self.new_download_context();
         context.initial_urls = initial_urls;
-        context.initial_file_name = initial_file_name;
         opener(context, window, cx);
     }
 
     pub(crate) fn open_new_download(&self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_new_download_with(Vec::new(), String::new(), window, cx);
+        self.open_new_download_with(Vec::new(), window, cx);
     }
 
-    /// 按表单提交创建任务；对话框确认后由宿主调用。
+    /// 按表单提交创建任务 / 确认外部捕获；对话框确认后由宿主调用。
     ///
-    /// 链接逐条 `daemon.task.create`，任一失败即在页面横幅提示；同时把本次
-    /// 保存目录记入本机偏好（无条件记录，开关开启后立即生效）。种子文件交给
-    /// agent 读取上传。返回的 future 在全部完成后给出是否全部成功。
+    /// 命令逐条执行，任一失败即在页面横幅提示；同时把本次保存目录记入本机偏好（无条件
+    /// 记录，开关开启后立即生效）。返回的 future 在全部完成后给出是否全部成功。
     pub fn create_download(
         &mut self,
         submission: NewDownloadSubmission,
@@ -310,44 +265,19 @@ impl DownloadView {
         if self.controller.is_stale() {
             return gpui::Task::ready(false);
         }
-        let futures = match submission {
-            NewDownloadSubmission::Tasks(requests) => {
-                if let Some(save_dir) = requests.first().map(|request| request.save_dir.clone()) {
-                    // 记录目录是尽力而为：失败不影响任务创建，也不进横幅。
-                    let remember = self
-                        .controller
-                        .execute(DownloadsCommand::SetLocalPreference {
-                            key: LAST_SAVE_DIR_PREF,
-                            value: serde_json::Value::String(save_dir),
-                        });
-                    cx.background_spawn(async move {
-                        let _ = remember.await;
-                    })
-                    .detach();
-                }
-                requests
-                    .into_iter()
-                    .map(|request| {
-                        self.controller.execute(DownloadsCommand::Create(Box::new(
-                            fluxdown_protocol::DaemonCreateTaskParams {
-                                request,
-                                torrent_blob_id: None,
-                                unattended: false,
-                            },
-                        )))
-                    })
-                    .collect::<Vec<_>>()
-            }
-            NewDownloadSubmission::TorrentFiles(paths) => paths
-                .iter()
-                .map(|path| {
-                    self.controller
-                        .execute(DownloadsCommand::SubmitTorrentFile {
-                            path: path.display().to_string(),
-                        })
-                })
-                .collect(),
-        };
+        if let Some(remember) = submission.remember_save_dir_command() {
+            // 记录目录是尽力而为：失败不影响任务创建，也不进横幅。
+            let remember = self.controller.execute(remember);
+            cx.background_spawn(async move {
+                let _ = remember.await;
+            })
+            .detach();
+        }
+        let futures = submission
+            .into_commands()
+            .into_iter()
+            .map(|command| self.controller.execute(command))
+            .collect::<Vec<_>>();
         cx.spawn(async move |this, cx| {
             let mut failed = false;
             for future in futures {
@@ -1064,7 +994,7 @@ impl DownloadView {
             self.execute_commands(torrent_commands, cx);
         }
         if !urls.is_empty() {
-            self.open_new_download_with(urls, String::new(), window, cx);
+            self.open_new_download_with(urls, window, cx);
         }
         if unsupported {
             window.push_notification(self.strings.unsupported_drop_hint.clone(), cx);

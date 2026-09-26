@@ -221,21 +221,22 @@ fn with_active_window(cx: &mut App, f: impl FnOnce(&Window) + 'static) {
     });
 }
 
-/// 退出：有活跃任务时先在当前窗口提示「下载将继续由后台服务执行」。
+/// 退出（菜单 / ⌘Q）：完全退出，后台 agent 与 daemon 一起停止。有活跃任务时先在当前窗口
+/// 确认「下载将暂停」。只退出界面、保留后台，走关闭窗口（托盘驻留时）。
 pub fn request_quit(cx: &mut App) {
     if Desktop::active_task_count(cx) == 0 {
-        cx.quit();
+        crate::lifecycle::quit_everything(cx);
         return;
     }
     cx.defer(|cx| {
         let Some(window) = WindowRegistry::focused_window(cx)
             .or_else(|| WindowRegistry::handle(cx, &WindowKey::Main))
         else {
-            cx.quit();
+            crate::lifecycle::quit_everything(cx);
             return;
         };
         let _ = window.update(cx, |_, window, cx| {
-            confirm_active_tasks(window, cx, |_, cx| cx.quit());
+            confirm_active_tasks(window, cx, |_, cx| crate::lifecycle::quit_everything(cx));
         });
     });
 }

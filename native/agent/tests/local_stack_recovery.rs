@@ -131,6 +131,100 @@ async fn client_observes_daemon_stale_recovery_and_agent_restart_state_restorati
     wait_for_process_exit(replacement_pid, Duration::from_secs(10)).await;
     stack.daemon_cleaned = true;
     std::fs::remove_dir_all(&root).expect("remove local stack data dir");
+    let _ = std::fs::remove_dir_all(short_home(&root));
+}
+
+/// 完全退出（握手前 `system.shutdown`，即版本替换与托盘「退出」共用的路径）：daemon 先
+/// 优雅退出，agent 随后以 `service-quit` 关闭 UI 连接并正常退出，且不再拉起 daemon。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires FLUXDOWN_TEST_DAEMON_BIN=<absolute fluxdownd path>"]
+async fn full_quit_stops_daemon_then_agent_and_tells_clients_not_to_reconnect() {
+    let daemon_binary = PathBuf::from(
+        std::env::var_os("FLUXDOWN_TEST_DAEMON_BIN").expect("FLUXDOWN_TEST_DAEMON_BIN is required"),
+    );
+    assert!(daemon_binary.is_file(), "daemon test binary does not exist");
+    let root = std::env::temp_dir().join(format!(
+        "fluxdown-local-stack-quit-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).expect("create local stack data dir");
+    let daemon_pid_file = root.join("daemon.pid");
+    let wrapper = create_daemon_wrapper(&root, &daemon_binary, &daemon_pid_file);
+    let daemon_address = reserve_address();
+    let agent_address = reserve_address();
+    let agent_token_file = root.join("agent").join("agent.token");
+    let mut stack = StackGuard::new(daemon_pid_file.clone());
+    stack.agent = Some(spawn_agent(
+        &root,
+        &wrapper,
+        daemon_address,
+        agent_address,
+        &agent_token_file,
+    ));
+    let token = wait_for_token(&agent_token_file, TOKEN_WAIT).await;
+    let mut client = connect_agent(agent_address, &token).await;
+    hello(&mut client, 1).await;
+    wait_snapshot(&mut client, 2, RECOVERY_WAIT, daemon_connected).await;
+    let daemon_pid = wait_for_daemon_pid(&daemon_pid_file, None, RECOVERY_WAIT).await;
+
+    let mut control = connect_agent(agent_address, &token).await;
+    let accepted = rpc_call(
+        &mut control,
+        1,
+        fluxdown_protocol::method::SYSTEM_SHUTDOWN,
+        None,
+    )
+    .await;
+    assert_eq!(accepted["result"]["ok"], json!(true), "{accepted}");
+
+    let close_reason = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match client.next().await {
+                Some(Ok(Message::Close(frame))) => {
+                    return frame.map(|frame| frame.reason.to_string());
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => return None,
+            }
+        }
+    })
+    .await
+    .expect("agent closed the UI connection");
+    assert_eq!(
+        close_reason.as_deref(),
+        Some(fluxdown_protocol::CLOSE_REASON_SERVICE_QUIT)
+    );
+    assert!(
+        !process_exists(daemon_pid),
+        "daemon must be gone before the agent releases its UI connections"
+    );
+
+    let agent = stack.agent.as_mut().expect("agent child");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = agent.try_wait().expect("wait for agent") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agent did not exit after full quit"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(status.success(), "agent exited unsuccessfully: {status}");
+    stack.agent = None;
+    stack.daemon_cleaned = true;
+    let respawned = std::fs::read_to_string(&daemon_pid_file)
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok());
+    assert_eq!(
+        respawned,
+        Some(daemon_pid),
+        "no daemon may be relaunched while quitting"
+    );
+    std::fs::remove_dir_all(&root).expect("remove local stack data dir");
+    let _ = std::fs::remove_dir_all(short_home(&root));
 }
 
 struct StackGuard {
@@ -189,7 +283,12 @@ fn spawn_agent(
     agent_address: std::net::SocketAddr,
     agent_token_file: &Path,
 ) -> Child {
+    // NMH 套接字与自启条目按 HOME 推导：隔离到短路径（Unix 套接字路径上限约 104 字节），
+    // 避免与本机正在运行的 agent 冲突。
+    let home = short_home(root);
+    std::fs::create_dir_all(&home).expect("create isolated agent HOME");
     Command::new(env!("CARGO_BIN_EXE_fluxdown-agent"))
+        .env("HOME", home)
         .env("FLUXDOWN_DATA_DIR", root)
         .env("FLUXDOWN_AGENT_DATA_DIR", root.join("agent"))
         .env("FLUXDOWN_AGENT_TOKEN_FILE", agent_token_file)
@@ -205,6 +304,15 @@ fn spawn_agent(
         .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn fluxdown-agent")
+}
+
+fn short_home(root: &Path) -> PathBuf {
+    let name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let suffix = &name[name.len().saturating_sub(12)..];
+    PathBuf::from("/tmp").join(format!("fdh-{suffix}"))
 }
 
 fn reserve_address() -> std::net::SocketAddr {

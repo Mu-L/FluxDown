@@ -407,6 +407,52 @@ pub struct GatewayPatchParams {
     pub regenerate_user_token: bool,
 }
 
+/// agent 托盘不可用的原因。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum TrayUnavailableReason {
+    /// agent 未编译托盘支持（headless 构建）：关闭全部 UI 后后台恒驻留。
+    NotBuilt,
+    /// 没有图形会话（无 `DISPLAY` / `WAYLAND_DISPLAY`）。
+    NoDisplay,
+    /// 桌面环境没有 StatusNotifier 托盘宿主（如未启用 AppIndicator 扩展的 GNOME）。
+    NoHost,
+    /// 平台托盘初始化失败（如缺少 appindicator 运行库）。
+    InitFailed,
+}
+
+/// agent 系统外壳状态：托盘可用性，以及关闭全部官方 UI 后后台是否继续驻留。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ShellStatusDto {
+    /// 托盘图标可用（`close_to_tray` 偏好可以生效）。
+    pub tray_available: bool,
+    pub tray_unavailable_reason: Option<TrayUnavailableReason>,
+    /// `true`：关闭全部 UI 只退出界面，agent + daemon 继续运行；`false`：随界面一起退出。
+    pub resident: bool,
+}
+
+/// 完成后关机的调度状态（agent 拥有状态机与执行）。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PowerStatusDto {
+    /// 已排定的延迟（秒）；`None` = 未启用。
+    pub armed_delay_secs: Option<u64>,
+    /// 全部任务结束、真正开始倒计时后的剩余秒数；等待任务完成阶段为 `None`。
+    pub countdown_remaining_secs: Option<u64>,
+}
+
+/// `agent.power.arm` 参数：全部任务完成后再等待 `delay_secs` 秒关机（0 = 立即）。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PowerArmParams {
+    pub delay_secs: u64,
+}
+
 /// agent 配置同步状态投影。
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -446,7 +492,10 @@ pub struct AgentPreferencesDto {
     pub values: BTreeMap<String, Value>,
 }
 
-/// 等待官方 UI 确认的外部捕获请求；不包含 cookie 或 header。
+/// 等待官方 UI 确认的外部捕获请求。
+///
+/// 不含 cookie / header / 请求体原文（这些只留在 agent 的捕获事务里，确认时由 agent
+/// 合并进建任务参数），只给出携带摘要供 UI 提示。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
@@ -462,33 +511,41 @@ pub struct PendingCaptureDto {
     /// 来源页面。
     #[serde(default)]
     pub referrer: String,
-}
-
-/// 官方 UI 确认捕获时对请求的覆盖；空字段沿用捕获原值。
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "camelCase")]
-pub struct CaptureOverridesDto {
+    /// 捕获方指定的保存目录（空 = 未指定）。
     #[serde(default)]
     pub save_dir: String,
+    /// 是否携带浏览器 Cookie。
     #[serde(default)]
-    pub file_name: String,
+    pub has_cookies: bool,
+    /// 携带的请求头名（不含值）。
     #[serde(default)]
-    pub queue_id: String,
-    /// 分段数（0 = 沿用）。
-    #[serde(default)]
-    pub segments: i32,
+    pub header_names: Vec<String>,
+}
+
+impl PendingCaptureDto {
+    /// 浏览器请求已带 `Authorization` 头（HTTP 认证沿用浏览器原值）。
+    #[must_use]
+    pub fn has_authorization(&self) -> bool {
+        self.header_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("authorization"))
+    }
 }
 
 /// `agent.capture.resolve` 参数。
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureResolveParams {
     pub transaction_id: String,
     pub accepted: bool,
+    /// 确认时官方 UI 表单产出的建任务参数（`None` = 按捕获原请求建任务）。
+    ///
+    /// agent 以捕获原请求为底合并：`url` / `method` / `body` / `audioUrl` 恒取捕获值；
+    /// `fileName` / `saveDir` / `cookies` / `referrer` 为空时取捕获值；`headers` 以捕获头
+    /// 为底、同名（忽略大小写）以表单为准；`userAgent` 非空时替换捕获的 `User-Agent` 头。
     #[serde(default)]
-    pub overrides: Option<CaptureOverridesDto>,
+    pub request: Option<crate::daemon::CreateTaskRequest>,
 }
 
 /// 桌面系统集成状态（开机自启、`.torrent` 关联、URL scheme 注册）。
@@ -783,29 +840,43 @@ mod capture_dto_tests {
     use super::{CaptureResolveParams, PendingCaptureDto};
 
     #[test]
-    fn resolve_params_without_overrides_field_deserializes() {
+    fn resolve_params_without_request_field_deserializes() {
         let params: CaptureResolveParams = serde_json::from_value(json!({
             "transactionId": "tx-1",
             "accepted": true,
         }))
-        .expect("deserialize without overrides");
+        .expect("deserialize without request");
         assert_eq!(params.transaction_id, "tx-1");
         assert!(params.accepted);
-        assert!(params.overrides.is_none());
+        assert!(params.request.is_none());
     }
 
     #[test]
-    fn pending_capture_without_file_size_or_referrer_deserializes_with_defaults() {
+    fn pending_capture_without_optional_fields_deserializes_with_defaults() {
         let capture: PendingCaptureDto = serde_json::from_value(json!({
             "transactionId": "tx-2",
             "url": "https://example.com/a.bin",
             "fileName": "a.bin",
             "createdAtUnixMs": 1_700_000_000_000_i64,
         }))
-        .expect("deserialize legacy payload without fileSize/referrer");
+        .expect("deserialize legacy payload without optional fields");
         assert_eq!(capture.transaction_id, "tx-2");
         assert_eq!(capture.file_size, 0);
         assert_eq!(capture.referrer, "");
+        assert!(!capture.has_cookies);
+        assert!(!capture.has_authorization());
+    }
+
+    #[test]
+    fn authorization_header_name_matches_case_insensitively() {
+        let capture: PendingCaptureDto = serde_json::from_value(json!({
+            "transactionId": "tx-3",
+            "url": "https://example.com/a.bin",
+            "createdAtUnixMs": 0,
+            "headerNames": ["accept", "AUTHORIZATION"],
+        }))
+        .expect("deserialize capture with header names");
+        assert!(capture.has_authorization());
     }
 }
 

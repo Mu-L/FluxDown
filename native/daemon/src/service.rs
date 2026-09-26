@@ -15,7 +15,8 @@ use fluxdown_protocol::{
     ApplicationErrorCode, CdnConfigApplyParams, CdnReportAckParams, CreateGroupRequest,
     CreateQueueRequest, DaemonConfigPatch, DaemonCreateTaskParams, MigrationAckParams,
     RpcErrorData, RpcErrorObject, RpcRequest, RpcResponse, SelectionResolutionDto, ServiceHello,
-    SiteAuthDeleteParams, SnapshotBody, TaskActivityQuery,
+    SiteAuthCredentialDto, SiteAuthDeleteParams, SiteAuthMatchParams, SnapshotBody,
+    TaskActivityQuery,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -465,6 +466,16 @@ impl DaemonService {
             method::DAEMON_SITE_AUTH_CLEAR => {
                 self.site_auth_operation(ActorOperation::SiteAuthClear)
                     .await
+            }
+            method::DAEMON_SITE_AUTH_MATCH => {
+                let params = parse_params::<SiteAuthMatchParams>(params)?;
+                let json = self
+                    .db
+                    .get_config(fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY)
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?
+                    .unwrap_or_default();
+                to_value(match_site_auth(&json, &params.url))
             }
             method::DAEMON_RSS_LIST_SOURCES => {
                 let sources = self
@@ -1658,6 +1669,18 @@ enum GroupAction {
     Resume,
 }
 
+/// 按链接站点键（与引擎 `apply_site_auth` 同一 `site_key`）查已保存凭据；非 http(s)
+/// 链接、无匹配或凭据表损坏都返回 `None`。
+fn match_site_auth(store_json: &str, url: &str) -> Option<SiteAuthCredentialDto> {
+    let site = fluxdown_engine::site_auth::site_key(url.trim())?;
+    let credential = fluxdown_engine::site_auth::parse_store(store_json).remove(&site)?;
+    Some(SiteAuthCredentialDto {
+        site,
+        user: credential.user,
+        pass: credential.pass,
+    })
+}
+
 fn parse_params<T: DeserializeOwned>(params: Option<Value>) -> Result<T, RpcErrorObject> {
     let Some(params) = params else {
         return Err(invalid_argument("params", "params are required"));
@@ -1762,7 +1785,28 @@ fn unsupported_error(message: &str) -> RpcErrorObject {
 mod tests {
     use fluxdown_protocol::{ApplicationErrorCode, RpcErrorData};
 
-    use super::DaemonService;
+    use super::{DaemonService, match_site_auth};
+
+    #[test]
+    fn site_auth_match_uses_engine_site_key_including_non_default_port() {
+        let store = r#"{"example.com":{"user":"u","pass":"p"},"example.com:8443":{"user":"alt","pass":"q"}}"#;
+        let matched = match_site_auth(store, "https://EXAMPLE.com/files/a.bin?x=1")
+            .expect("default port matches bare host");
+        assert_eq!(
+            (
+                matched.site.as_str(),
+                matched.user.as_str(),
+                matched.pass.as_str()
+            ),
+            ("example.com", "u", "p")
+        );
+        let alt = match_site_auth(store, "https://example.com:8443/a.bin")
+            .expect("explicit non-default port matches host:port");
+        assert_eq!(alt.user, "alt");
+        assert!(match_site_auth(store, "https://other.example.com/a.bin").is_none());
+        assert!(match_site_auth(store, "magnet:?xt=urn:btih:abc").is_none());
+        assert!(match_site_auth("not json", "https://example.com/a.bin").is_none());
+    }
 
     #[tokio::test]
     async fn every_canonical_daemon_method_reaches_a_real_dispatch_branch() {

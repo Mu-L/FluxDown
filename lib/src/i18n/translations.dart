@@ -877,7 +877,10 @@ class S {
   String get closeToTrayDesc => _r('closeToTrayDesc');
   String get startMinimizedToTray => _r('startMinimizedToTray');
   String get startMinimizedToTrayDesc => _r('startMinimizedToTrayDesc');
-  String get trayUnsupportedLinux => _r('trayUnsupportedLinux');
+  String get trayUnavailableNoHost => _r('trayUnavailableNoHost');
+  String get trayUnavailableNoDisplay => _r('trayUnavailableNoDisplay');
+  String get trayUnavailableInitFailed => _r('trayUnavailableInitFailed');
+  String get trayUnavailableNotBuilt => _r('trayUnavailableNotBuilt');
   String get floatingBall => _r('floatingBall');
   String get floatingBallDesc => _r('floatingBallDesc');
   String get floatingBallActiveOnly => _r('floatingBallActiveOnly');
@@ -1748,20 +1751,18 @@ class S {
       _r('selectionAutoDefaultIn', {'seconds': seconds});
 
   // ─────────────────────────────────────────────
-  // GPUI 快速捕获窗口
+  // GPUI 新建下载窗口：外部捕获提示
   // ─────────────────────────────────────────────
-  String get quickCaptureTitle => _r('quickCaptureTitle');
-  String get quickCaptureDownload => _r('quickCaptureDownload');
-  String get quickCaptureIgnore => _r('quickCaptureIgnore');
-  String get quickCaptureDownloadAll => _r('quickCaptureDownloadAll');
-  String get quickCaptureIgnoreAll => _r('quickCaptureIgnoreAll');
-  String get quickCaptureMoreOptions => _r('quickCaptureMoreOptions');
+  String get newDownloadCaptureContextHint =>
+      _r('newDownloadCaptureContextHint');
+  String get newDownloadCaptureAuthHint => _r('newDownloadCaptureAuthHint');
 
   // ─────────────────────────────────────────────
   // TrayService
   // ─────────────────────────────────────────────
   String get trayShowWindow => _r('trayShowWindow');
   String get trayExit => _r('trayExit');
+  String get trayCancelShutdown => _r('trayCancelShutdown');
 
   // ─────────────────────────────────────────────
   // 应用菜单与桌面标题栏

@@ -88,7 +88,7 @@ fn language_field(ctx: &SectionContext) -> Control {
                 store.set_pref_str(LOCALE_KEY, value.to_string(), cx)
             });
             let target = if value.as_ref() == "system" {
-                system_locale()
+                fluxdown_ui_i18n::system_locale()
             } else {
                 value.to_string()
             };
@@ -501,14 +501,4 @@ fn ui_scale_field(ctx: &SectionContext) -> Control {
             });
         },
     )
-}
-
-fn system_locale() -> String {
-    std::env::var("LC_ALL")
-        .or_else(|_| std::env::var("LC_MESSAGES"))
-        .or_else(|_| std::env::var("LANG"))
-        .ok()
-        .and_then(|value| value.split('.').next().map(str::to_owned))
-        .filter(|value| !value.is_empty() && value != "C" && value != "POSIX")
-        .unwrap_or_else(|| "en".to_owned())
 }

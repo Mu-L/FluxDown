@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use fluxdown_protocol::{AgentSnapshot, ServiceEvent};
@@ -13,13 +12,60 @@ use tokio_util::sync::CancellationToken;
 use crate::api_host::AgentApiHost;
 use crate::daemon_client::{DaemonClient, DaemonClientConfig, DaemonClientEvent};
 use crate::event_hub::AgentEventHub;
-use crate::gateway::{GatewayService, load_or_create_bearer};
+use crate::gateway::{GatewayService, GatewayShell, load_or_create_bearer};
+use crate::lifecycle::Lifecycle;
+use crate::power::PowerService;
+use crate::shell::{ShellHost, ShellServices, ShellState};
 use crate::state::{AgentState, StateError, StateStore};
 use crate::supervisor::DaemonSupervisor;
 
-pub async fn run(
-    cancel: CancellationToken,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub type AgentResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+/// 在当前线程构建 tokio runtime 并运行 agent 直到退出；SIGTERM / Ctrl-C 只退出 agent。
+pub fn run_blocking(host: ShellHost) -> AgentResult {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let cancel = CancellationToken::new();
+        let signal_cancel = cancel.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            signal_cancel.cancel();
+        });
+        run(cancel, host).await
+    })
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        return;
+    };
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if result.is_err() {
+                terminate.recv().await;
+            }
+        }
+        _ = terminate.recv() => {}
+    }
+}
+
+/// GUI 子系统进程没有控制台时 Ctrl-C 处理器可能注册失败：失败即永不触发，而不是立刻退出。
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+pub async fn run(cancel: CancellationToken, host: ShellHost) -> AgentResult {
     let paths = AgentPaths::resolve()?;
     let store = match StateStore::open(paths.agent_data_dir.clone()).await {
         Ok(store) => Arc::new(store),
@@ -56,7 +102,8 @@ pub async fn run(
         rpc_url: paths.daemon_rpc_url.clone(),
         bearer: daemon_bearer,
     };
-    let (daemon, mut daemon_events) = DaemonClient::start(daemon_config.clone(), supervisor)?;
+    let (daemon, mut daemon_events) =
+        DaemonClient::start(daemon_config.clone(), supervisor.clone())?;
     let daemon = Arc::new(daemon);
     daemon
         .wait_ready(Duration::from_secs(30))
@@ -88,12 +135,26 @@ pub async fn run(
         gateway: state.gateway.clone(),
         linked_devices: crate::link::public_devices(&state),
         remote_tasks: state.remote_tasks.clone(),
+        shell: crate::shell::shell_status(host.availability, &state.preferences),
         ..AgentSnapshot::default()
     };
     let events = AgentEventHub::new(initial);
+    let lifecycle = Arc::new(Lifecycle::new(
+        cancel.clone(),
+        daemon.clone(),
+        supervisor,
+        paths.daemon_data_dir.clone(),
+    ));
+    let shell = ShellState::new(host.availability, daemon.clone(), events.clone());
+    let power = Arc::new(PowerService::new(events.clone()));
+    let power_task = tokio::spawn(power.clone().run(cancel.clone()));
     let event_task = spawn_daemon_projection(daemon_events, events.clone(), cancel.clone());
     let effects_task = tokio::spawn(
-        crate::background_effects::BackgroundEffects::new(events.clone()).run(cancel.clone()),
+        crate::background_effects::BackgroundEffects::new(
+            events.clone(),
+            paths.agent_data_dir.clone(),
+        )
+        .run(cancel.clone()),
     );
 
     let shared_state = Arc::new(tokio::sync::Mutex::new(state));
@@ -154,11 +215,10 @@ pub async fn run(
         )
         .run(cancel.clone()),
     );
-    let ui_clients = Arc::new(AtomicUsize::new(0));
     let capture = Arc::new(crate::capture::CaptureService::new(
         daemon.clone(),
         events.clone(),
-        ui_clients.clone(),
+        shell.clone(),
     ));
     let blobs = Arc::new(crate::capture::DaemonBlobClient::new(&daemon_config)?);
     let mut nmh_task = tokio::spawn(
@@ -191,9 +251,12 @@ pub async fn run(
         store.clone(),
         api_switches,
         api_token,
-        ui_clients,
+        GatewayShell {
+            shell: shell.clone(),
+            power: power.clone(),
+            lifecycle: lifecycle.clone(),
+        },
     ));
-    let api_host = Arc::new(AgentApiHost::new(daemon, events, capture));
     let bearer = load_or_create_bearer(
         store.data_dir(),
         std::env::var_os("FLUXDOWN_AGENT_TOKEN_FILE")
@@ -201,6 +264,26 @@ pub async fn run(
             .map(Path::new),
     )
     .await?;
+    let shell_task = tokio::spawn(crate::shell::run_controller(
+        ShellServices {
+            state: shell,
+            lifecycle,
+            power,
+            daemon: daemon.clone(),
+            events: events.clone(),
+            gateway: gateway_service.clone(),
+        },
+        host,
+        cancel.clone(),
+    ));
+    #[cfg(feature = "desktop")]
+    crate::clipboard_watch::spawn(events.clone(), gateway_service.clone(), cancel.clone());
+    if let Ok(Err(error)) =
+        tokio::task::spawn_blocking(crate::platform::migrate_legacy_autostart).await
+    {
+        tracing::warn!(error = %error, "could not migrate legacy autostart entry");
+    }
+    let api_host = Arc::new(AgentApiHost::new(daemon, events, capture));
     let (result, nmh_completed): (Result<(), Box<dyn std::error::Error + Send + Sync>>, bool) = tokio::select! {
         gateway = crate::gateway::serve(
             listener,
@@ -226,6 +309,8 @@ pub async fn run(
     let _ = remote_task.await;
     let _ = effects_task.await;
     let _ = analytics_task.await;
+    let _ = power_task.await;
+    let _ = shell_task.await;
     if !nmh_completed {
         let _ = nmh_task.await;
     }
@@ -412,6 +497,8 @@ const DEFAULT_GATEWAY_PORT: u16 = 17800;
 
 struct AgentPaths {
     agent_data_dir: PathBuf,
+    /// daemon 的 engine 数据目录（`daemon.lock` 进程租约所在）。
+    daemon_data_dir: PathBuf,
     daemon_token_file: PathBuf,
     daemon_rpc_url: String,
 }
@@ -426,20 +513,19 @@ impl AgentPaths {
         let agent_data_dir = std::env::var_os("FLUXDOWN_AGENT_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("agent"));
-        // daemon 的 bearer 落在 engine 数据目录（`fluxdown_engine::data_dir::resolve_data_dir`），
+        // daemon 的 bearer 与进程租约落在 engine 数据目录（`fluxdown_engine::data_dir::resolve_data_dir`），
         // 与 agent 自己的 ProjectDirs 根不同；未显式指定时必须按同一规则推导，否则永远等不到 token。
+        let daemon_data_dir = std::env::var_os("FLUXDOWN_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(engine_data_dir);
         let daemon_token_file = std::env::var_os("FLUXDOWN_DAEMON_TOKEN_FILE")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::var_os("FLUXDOWN_DATA_DIR")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(engine_data_dir)
-                    .join("daemon.token")
-            });
+            .unwrap_or_else(|| daemon_data_dir.join("daemon.token"));
         let daemon_rpc_url = std::env::var("FLUXDOWN_DAEMON_URL")
             .unwrap_or_else(|_| "ws://127.0.0.1:17801/rpc".to_owned());
         Ok(Self {
             agent_data_dir,
+            daemon_data_dir,
             daemon_token_file,
             daemon_rpc_url,
         })

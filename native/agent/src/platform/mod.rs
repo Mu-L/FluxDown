@@ -1,9 +1,10 @@
 //! agent 桌面系统集成：任务文件打开/定位、官方桌面进程唤起、开机自启、
 //! `.torrent` 关联与 URL scheme 注册。
 //!
-//! 所有注册的目标都是官方桌面程序而非 agent 自身：Windows 指向同级
+//! 关联与 URL scheme 的注册目标是官方桌面程序：Windows 指向同级
 //! `fluxdown-desktop.exe`，macOS 指向 agent 所在的 `.app` bundle，Linux 指向
-//! 打包的 `com.fluxdown.app.desktop`。全部函数同步阻塞，RPC 侧需放入
+//! 打包的 `com.fluxdown.app.desktop`。开机自启的目标是 agent 自身（`--autostart`），
+//! 由 agent 按托盘偏好决定是否再拉起桌面程序。全部函数同步阻塞，RPC 侧需放入
 //! `spawn_blocking`。
 
 mod autostart;
@@ -14,14 +15,14 @@ mod protocol_registry;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use fluxdown_protocol::PlatformIntegrationDto;
 
-/// 上次为捕获拉起桌面程序的 unix 毫秒时间戳（0 = 从未拉起）。
-static LAST_CAPTURE_LAUNCH_MS: AtomicI64 = AtomicI64::new(0);
-/// 两次捕获拉起之间的最小间隔：已有 UI 客户端连接时不拉起，断线重连抖动也不重复拉起。
-const CAPTURE_LAUNCH_COOLDOWN_MS: i64 = 10_000;
+/// 两次「为待确认交互拉起桌面程序」之间的最小间隔：断线重连抖动也不重复拉起。
+pub const PROMPT_LAUNCH_COOLDOWN_MS: i64 = 10_000;
+
+/// 自启动条目传给 agent 的参数。
+pub const AUTOSTART_ARG: &str = "--autostart";
 
 const DESKTOP_EXECUTABLE_NAME: &str = if cfg!(windows) {
     "fluxdown-desktop.exe"
@@ -51,46 +52,42 @@ pub fn open_path(path: &Path, reveal: bool) -> Result<(), PlatformError> {
     launch_path(path, reveal)
 }
 
-/// 无 UI 客户端连接（`ui_clients == 0`）且距上次拉起 ≥ 10s 才需要为捕获拉起桌面程序。
-fn should_launch_desktop_for_capture(
-    ui_clients: &AtomicUsize,
-    last_launch_ms: i64,
-    now_ms: i64,
-) -> bool {
-    ui_clients.load(Ordering::Acquire) == 0
-        && now_ms.saturating_sub(last_launch_ms) >= CAPTURE_LAUNCH_COOLDOWN_MS
+/// 无 UI 客户端连接且距上次拉起不低于冷却时间，才需要为待确认交互拉起桌面程序。
+#[must_use]
+pub fn should_launch_for_prompt(ui_clients: usize, last_launch_ms: i64, now_ms: i64) -> bool {
+    ui_clients == 0 && now_ms.saturating_sub(last_launch_ms) >= PROMPT_LAUNCH_COOLDOWN_MS
 }
 
-/// 待确认捕获入队时，若当前无已连接的桌面 UI 才拉起同级桌面程序进入 `--capture` 模式；
-/// 已有 UI 或距上次拉起不足 10s 时静默跳过。
-pub fn launch_desktop_for_capture(ui_clients: &AtomicUsize) -> Result<(), PlatformError> {
-    let now = now_unix_ms();
-    let last = LAST_CAPTURE_LAUNCH_MS.load(Ordering::Acquire);
-    if !should_launch_desktop_for_capture(ui_clients, last, now) {
-        return Ok(());
-    }
-    if LAST_CAPTURE_LAUNCH_MS
-        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        // 另一并发调用抢先更新了时间戳，视为已处理。
-        return Ok(());
-    }
+/// 拉起同级桌面程序；桌面已在运行时新进程经单实例通道转发激活/链接后立即退出。
+pub fn launch_desktop(args: &[&str]) -> Result<(), PlatformError> {
     let executable = desktop_executable().ok_or(PlatformError::Unsupported(
         "fluxdown-desktop is not installed next to fluxdown-agent",
     ))?;
     let mut command = std::process::Command::new(executable);
-    command.arg("--capture");
     command
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    set_no_console_window(&mut command);
+    detach_from_agent(&mut command);
     command.spawn()?;
     Ok(())
 }
 
-fn now_unix_ms() -> i64 {
+/// Unix 下桌面进程进入独立进程组：从终端启动的 agent 收到 Ctrl-C 不连带终止界面。
+#[cfg(unix)]
+fn detach_from_agent(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn detach_from_agent(command: &mut std::process::Command) {
+    set_no_console_window(command);
+}
+
+#[must_use]
+pub fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| {
@@ -114,7 +111,8 @@ pub fn integration_status() -> PlatformIntegrationDto {
         .collect();
     PlatformIntegrationDto {
         autostart_supported: autostart::supported(target),
-        autostart_enabled: target.is_some_and(autostart::is_enabled),
+        autostart_enabled: target.is_some()
+            && agent_executable().is_ok_and(|agent| autostart::is_enabled(&agent)),
         file_association_supported: file_association::supported(target),
         torrent_associated: file_association::is_associated(),
         url_protocol_supported: protocol_registry::supported(target),
@@ -125,14 +123,33 @@ pub fn integration_status() -> PlatformIntegrationDto {
     }
 }
 
+/// 开机自启 agent（`--autostart`）；要求桌面程序已安装在同级目录，保证自启后能拉起界面。
 pub fn set_autostart(enabled: bool) -> Result<(), PlatformError> {
     if !enabled {
         return autostart::disable();
     }
-    let desktop = desktop_executable().ok_or(PlatformError::Unsupported(
+    desktop_executable().ok_or(PlatformError::Unsupported(
         "fluxdown-desktop is not installed next to fluxdown-agent",
     ))?;
-    autostart::enable(&desktop)
+    autostart::enable(&agent_executable()?)
+}
+
+/// 旧版自启条目直接拉起桌面程序（`fluxdown-desktop --minimized`）；启动时改写为 agent，
+/// 托盘驻留与「启动时最小化到托盘」才能在不开界面的情况下生效。
+pub fn migrate_legacy_autostart() -> Result<(), PlatformError> {
+    let Some(desktop) = desktop_executable() else {
+        return Ok(());
+    };
+    let agent = agent_executable()?;
+    if autostart::is_enabled(&agent) || !autostart::targets(&desktop) {
+        return Ok(());
+    }
+    tracing::info!("migrating legacy desktop autostart entry to fluxdown-agent");
+    autostart::enable(&agent)
+}
+
+fn agent_executable() -> Result<PathBuf, PlatformError> {
+    Ok(std::env::current_exe()?)
 }
 
 pub fn set_file_association(enabled: bool) -> Result<(), PlatformError> {
@@ -198,14 +215,14 @@ fn set_no_console_window(command: &mut std::process::Command) {
     command.creation_flags(0x0800_0000);
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 fn set_no_console_window(_command: &mut std::process::Command) {}
 
-/// 注册表命令行使用的桌面程序路径：canonicalize 解析符号链接后去掉 `\\?\`
+/// 注册表命令行使用的可执行文件路径：canonicalize 解析符号链接后去掉 `\\?\`
 /// 前缀，便于与安装器写入的值比较。
 #[cfg(windows)]
-fn registry_executable(desktop: Option<&Path>) -> Result<String, PlatformError> {
-    let path = desktop.ok_or(PlatformError::Unsupported(
+fn registry_executable(executable: Option<&Path>) -> Result<String, PlatformError> {
+    let path = executable.ok_or(PlatformError::Unsupported(
         "fluxdown-desktop.exe is not installed next to fluxdown-agent",
     ))?;
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -327,12 +344,10 @@ mod tests {
     }
 
     #[test]
-    fn should_launch_desktop_for_capture_requires_no_ui_clients_and_cooldown_elapsed() {
-        let zero = AtomicUsize::new(0);
-        let one = AtomicUsize::new(1);
-        assert!(should_launch_desktop_for_capture(&zero, 0, 20_000));
-        assert!(!should_launch_desktop_for_capture(&one, 0, 20_000));
-        assert!(!should_launch_desktop_for_capture(&zero, 15_000, 20_000));
-        assert!(should_launch_desktop_for_capture(&zero, 0, 10_000));
+    fn prompt_launch_requires_no_ui_clients_and_cooldown_elapsed() {
+        assert!(should_launch_for_prompt(0, 0, 20_000));
+        assert!(!should_launch_for_prompt(1, 0, 20_000));
+        assert!(!should_launch_for_prompt(0, 15_000, 20_000));
+        assert!(should_launch_for_prompt(0, 0, 10_000));
     }
 }

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use fluxdown_protocol::method;
 use fluxdown_protocol::{
-    ApplicationErrorCode, EventFrame, RequestId, RpcErrorData, RpcNotification, RpcRequest,
-    RpcResponse, ServiceHello, ServiceRole, Snapshot, SnapshotBody,
+    ApplicationErrorCode, CLOSE_REASON_SERVICE_QUIT, EventFrame, RequestId, RpcErrorData,
+    RpcNotification, RpcRequest, RpcResponse, ServiceHello, ServiceRole, Snapshot, SnapshotBody,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -35,6 +35,8 @@ pub enum AgentClientEvent {
     Event(Box<EventFrame>),
     Stale,
     Fatal(RpcErrorData),
+    /// agent 执行了完全退出（`system.shutdown`）：不再重连，界面随之退出。
+    ServiceStopped,
 }
 
 #[derive(Clone)]
@@ -52,6 +54,7 @@ struct ClientCommand {
 pub struct AgentClient {
     commands: mpsc::Sender<ClientCommand>,
     runtime: Arc<tokio::runtime::Runtime>,
+    bootstrap: Arc<ServiceBootstrap>,
 }
 
 impl AgentClient {
@@ -69,8 +72,20 @@ impl AgentClient {
         );
         let (commands, command_rx) = mpsc::channel(64);
         let (events, event_rx) = mpsc::channel(1024);
-        runtime.spawn(run_client(config, bootstrap, command_rx, events));
-        Ok((Arc::new(Self { commands, runtime }), event_rx))
+        runtime.spawn(run_client(config, bootstrap.clone(), command_rx, events));
+        Ok((
+            Arc::new(Self {
+                commands,
+                runtime,
+                bootstrap,
+            }),
+            event_rx,
+        ))
+    }
+
+    /// 界面发起完全退出后调用：连接断开时不再拉起新的 agent。
+    pub fn stop_service_bootstrap(&self) {
+        self.bootstrap.stop();
     }
 
     pub fn call<P, R>(&self, method_name: &str, params: Option<P>) -> AgentFuture<R>
@@ -114,8 +129,9 @@ async fn run_client(
     mut commands: mpsc::Receiver<ClientCommand>,
     events: mpsc::Sender<AgentClientEvent>,
 ) {
-    let backoff = [1_u64, 2, 5, 15, 30];
     let mut attempt = 0_usize;
+    // 每个桌面进程只尝试替换一次协议不兼容的 agent，避免同目录二进制错配时反复互杀。
+    let mut replaced_incompatible = false;
     loop {
         match connect(&config).await {
             Ok((socket, snapshot, buffered)) => {
@@ -128,12 +144,18 @@ async fn run_client(
                 {
                     return;
                 }
-                if run_connected(socket, &mut commands, &events, cursor, buffered)
-                    .await
-                    .is_err()
-                    && events.send(AgentClientEvent::Stale).await.is_err()
-                {
-                    return;
+                match run_connected(socket, &mut commands, &events, cursor, buffered).await {
+                    Ok(SessionEnd::ClientDropped) => return,
+                    Ok(SessionEnd::ServiceQuit) => {
+                        bootstrap.stop();
+                        let _ = events.send(AgentClientEvent::ServiceStopped).await;
+                        return;
+                    }
+                    Err(()) => {
+                        if events.send(AgentClientEvent::Stale).await.is_err() {
+                            return;
+                        }
+                    }
                 }
             }
             Err(ConnectError::Refused) => {
@@ -142,6 +164,25 @@ async fn run_client(
                 {
                     return;
                 }
+            }
+            Err(ConnectError::Incompatible) if !replaced_incompatible => {
+                replaced_incompatible = true;
+                if request_shutdown(&config).await {
+                    // 旧 agent 关停 daemon 后退出；连接被拒时由 bootstrap 拉起同级新版本。
+                    crate::service_bootstrap::wait_until_stopped(
+                        &config.rpc_url,
+                        Duration::from_secs(30),
+                    )
+                    .await;
+                    attempt = 0;
+                    continue;
+                }
+                let _ = events.send(AgentClientEvent::Fatal(protocol_error())).await;
+                return;
+            }
+            Err(ConnectError::Incompatible) => {
+                let _ = events.send(AgentClientEvent::Fatal(protocol_error())).await;
+                return;
             }
             Err(ConnectError::Fatal(error)) => {
                 let _ = events.send(AgentClientEvent::Fatal(error)).await;
@@ -153,15 +194,37 @@ async fn run_client(
                 }
             }
         }
-        let delay = backoff[attempt.min(backoff.len() - 1)];
+        tokio::time::sleep(retry_delay(attempt)).await;
         attempt = attempt.saturating_add(1);
-        tokio::time::sleep(Duration::from_secs(delay)).await;
     }
 }
 
-async fn connect(
-    config: &AgentClientConfig,
-) -> Result<(Socket, Snapshot, Vec<EventFrame>), ConnectError> {
+/// 连续快速重试的次数（100ms 间隔，约 5s）：覆盖回环重连、agent 冷启动与重启，让界面在
+/// 连接宽限内恢复而不显示连接态；之后指数退避，避免后台长期不可用时空转。
+const FAST_RETRY_ATTEMPTS: usize = 50;
+const FAST_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const BACKOFF_SECS: [u64; 5] = [1, 2, 5, 15, 30];
+
+/// 第 `attempt` 次（从 0 起）连接失败后的等待时间。
+fn retry_delay(attempt: usize) -> Duration {
+    match attempt.checked_sub(FAST_RETRY_ATTEMPTS) {
+        None => FAST_RETRY_INTERVAL,
+        Some(slow) => Duration::from_secs(BACKOFF_SECS[slow.min(BACKOFF_SECS.len() - 1)]),
+    }
+}
+
+/// 握手前 `system.shutdown`：只有支持该首帧的 agent（协议 v4 起）会受理。
+async fn request_shutdown(config: &AgentClientConfig) -> bool {
+    let Ok(mut socket) = open_socket(config).await else {
+        return false;
+    };
+    let mut buffered = Vec::new();
+    call_on_socket(&mut socket, 1, method::SYSTEM_SHUTDOWN, None, &mut buffered)
+        .await
+        .is_ok()
+}
+
+async fn open_socket(config: &AgentClientConfig) -> Result<Socket, ConnectError> {
     let bearer = tokio::fs::read_to_string(&config.bearer_path)
         .await
         .map_err(|_| ConnectError::Refused)?;
@@ -179,9 +242,16 @@ async fn connect(
     request
         .headers_mut()
         .insert(header::AUTHORIZATION, authorization);
-    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+    let (socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(classify_connect_error)?;
+    Ok(socket)
+}
+
+async fn connect(
+    config: &AgentClientConfig,
+) -> Result<(Socket, Snapshot, Vec<EventFrame>), ConnectError> {
+    let mut socket = open_socket(config).await?;
     let mut buffered = Vec::new();
     let hello = serde_json::json!({
         "clientName": "fluxdown-desktop",
@@ -198,13 +268,20 @@ async fn connect(
         Some(hello),
         &mut buffered,
     )
-    .await?;
+    .await
+    .map_err(|error| match error {
+        ConnectError::Fatal(data) if data.code == ApplicationErrorCode::ProtocolIncompatible => {
+            ConnectError::Incompatible
+        }
+        other => other,
+    })?;
     let service = serde_json::from_value::<ServiceHello>(hello_value)
         .map_err(|_| ConnectError::Fatal(protocol_error()))?;
-    if service.role != ServiceRole::Agent
-        || service.protocol_version != fluxdown_protocol::PROTOCOL_VERSION
-    {
+    if service.role != ServiceRole::Agent {
         return Err(ConnectError::Fatal(protocol_error()));
+    }
+    if service.protocol_version != fluxdown_protocol::PROTOCOL_VERSION {
+        return Err(ConnectError::Incompatible);
     }
     let snapshot_value =
         call_on_socket(&mut socket, 2, method::SYSTEM_SNAPSHOT, None, &mut buffered).await?;
@@ -216,13 +293,21 @@ async fn connect(
     Ok((socket, snapshot, buffered))
 }
 
+/// 连接正常结束的原因；`Err(())` 表示断线（需重连）。
+enum SessionEnd {
+    /// 本进程已丢弃客户端（命令通道关闭）。
+    ClientDropped,
+    /// agent 以 `service-quit` 关闭：完全退出，不再重连。
+    ServiceQuit,
+}
+
 async fn run_connected(
     mut socket: Socket,
     commands: &mut mpsc::Receiver<ClientCommand>,
     events: &mpsc::Sender<AgentClientEvent>,
     snapshot_cursor: (String, u64),
     buffered: Vec<EventFrame>,
-) -> Result<(), ()> {
+) -> Result<SessionEnd, ()> {
     let mut next_id = 10_i64;
     let mut pending = HashMap::<i64, oneshot::Sender<Result<Value, RpcErrorData>>>::new();
     let mut cursor = snapshot_cursor;
@@ -234,7 +319,7 @@ async fn run_connected(
     loop {
         tokio::select! {
             command = commands.recv() => {
-                let Some(command) = command else { return Ok(()); };
+                let Some(command) = command else { return Ok(SessionEnd::ClientDropped); };
                 let id = next_id;
                 next_id = next_id.saturating_add(1);
                 let request = RpcRequest::new(RequestId::Integer(id), command.method, command.params);
@@ -243,7 +328,19 @@ async fn run_connected(
                 if socket.send(Message::Text(text.into())).await.is_err() { break; }
             }
             incoming = socket.next() => {
-                let Some(Ok(Message::Text(text))) = incoming else { break; };
+                let text = match incoming {
+                    Some(Ok(Message::Text(text))) => text,
+                    Some(Ok(Message::Close(Some(frame))))
+                        if frame.reason.as_str() == CLOSE_REASON_SERVICE_QUIT =>
+                    {
+                        for (_, ack) in pending.drain() {
+                            let _ = ack.send(Err(unavailable_error()));
+                        }
+                        return Ok(SessionEnd::ServiceQuit);
+                    }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
+                    _ => break,
+                };
                 if let Ok(notification) = serde_json::from_str::<RpcNotification>(&text)
                     && notification.method == method::SERVICE_EVENT
                 {
@@ -368,6 +465,8 @@ fn classify_connect_error(error: tokio_tungstenite::tungstenite::Error) -> Conne
 enum ConnectError {
     Refused,
     Transient,
+    /// 对端协议版本不兼容：可尝试让旧 agent 退出后由 bootstrap 拉起同级新版本。
+    Incompatible,
     Fatal(RpcErrorData),
 }
 

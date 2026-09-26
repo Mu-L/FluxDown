@@ -7,12 +7,14 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
+use fluxdown_protocol::capture_link;
+
 /// 已解析的命令行。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LaunchOptions {
     /// 启动后最小化主窗口（自启动场景）。
     pub minimized: bool,
-    /// 由 agent 为外部捕获拉起：不开主窗口，只开快速捕获窗口。
+    /// 由 agent 为待确认的捕获 / 选择请求拉起：不开主窗口，只开确认窗口。
     pub capture_only: bool,
     /// 仅唤起已有 UI；绝不新建 UI 或启动本机后台服务。
     pub activate_existing: bool,
@@ -31,7 +33,7 @@ impl LaunchOptions {
                 "--minimized" | "--start-minimized" => options.minimized = true,
                 "--capture" => options.capture_only = true,
                 "--activate-existing" => options.activate_existing = true,
-                value if is_capture_url(value) => options.urls.push(value.to_owned()),
+                value if capture_link::is_capture_url(value) => options.urls.push(value.to_owned()),
                 value if value.starts_with("--") => {}
                 value => {
                     if let Some(path) = torrent_path(value) {
@@ -44,72 +46,10 @@ impl LaunchOptions {
     }
 }
 
-/// `.torrent` 路径或 `file://` URL → 本机路径。
+/// `.torrent` 路径或 `file://` URL → 已存在的本机文件路径。
 #[must_use]
 pub fn torrent_path(value: &str) -> Option<PathBuf> {
-    let raw = value.strip_prefix("file://").map_or(value, |rest| rest);
-    let decoded = percent_decode(raw);
-    if !decoded.to_ascii_lowercase().ends_with(".torrent") {
-        return None;
-    }
-    let path = PathBuf::from(decoded);
-    path.is_file().then_some(path)
-}
-
-/// 判定参数是否为可直接建任务的链接（与 agent 捕获入口一致）。
-#[must_use]
-pub fn is_capture_url(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    [
-        "magnet:",
-        "ed2k://",
-        "fluxdown:",
-        "http://",
-        "https://",
-        "ftp://",
-        "ftps://",
-    ]
-    .iter()
-    .any(|scheme| lower.starts_with(scheme))
-}
-
-/// `fluxdown:` 协议 → 实际下载链接：`fluxdown://download?url=<encoded>` 或
-/// `fluxdown:<url>`；其他 scheme 原样返回。
-#[must_use]
-pub fn normalize_capture_url(value: &str) -> String {
-    let lower = value.to_ascii_lowercase();
-    if !lower.starts_with("fluxdown:") {
-        return value.to_owned();
-    }
-    let rest = &value["fluxdown:".len()..];
-    let rest = rest.trim_start_matches('/');
-    if let Some(query) = rest.strip_prefix("download?") {
-        for pair in query.split('&') {
-            if let Some(encoded) = pair.strip_prefix("url=") {
-                return percent_decode(encoded);
-            }
-        }
-    }
-    percent_decode(rest)
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hex = &value[index + 1..index + 3];
-            if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                out.push(byte);
-                index += 3;
-                continue;
-            }
-        }
-        out.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| value.to_owned())
+    capture_link::torrent_file_path(value).filter(|path| path.is_file())
 }
 
 /// 单实例锁：持有期间文件锁不释放；第二个进程 `try_acquire` 失败。
@@ -172,19 +112,6 @@ mod tests {
             Some(file.clone())
         );
         let _ = std::fs::remove_file(file);
-    }
-
-    #[test]
-    fn normalizes_fluxdown_scheme() {
-        assert_eq!(
-            normalize_capture_url("fluxdown://download?url=https%3A%2F%2Fa.b%2Fc"),
-            "https://a.b/c"
-        );
-        assert_eq!(
-            normalize_capture_url("fluxdown:https://a.b/c"),
-            "https://a.b/c"
-        );
-        assert_eq!(normalize_capture_url("magnet:?x"), "magnet:?x");
     }
 
     #[test]

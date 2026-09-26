@@ -10,8 +10,8 @@ use fluxdown_protocol::{
     AgentEvent, AgentPreferencesDto, AgentSnapshot, ApplicationErrorCode, ComponentStatusDto,
     ConnPolicySummaryDto, DaemonConfigPatch, DaemonConfigSnapshot, DaemonEvent,
     DiagnosticsReportDto, GatewayPatchParams, GatewayStatusDto, PlatformIntegrationDto, PluginDto,
-    QueueDto, RpcErrorData, ServiceEvent, SettingOwner, SiteAuthEntryDto, SyncStatusDto,
-    SystemProxyDto, UpdateCheckResultDto, WebhookDeliveryDto, method, setting_spec,
+    QueueDto, RpcErrorData, ServiceEvent, SettingOwner, ShellStatusDto, SiteAuthEntryDto,
+    SyncStatusDto, SystemProxyDto, UpdateCheckResultDto, WebhookDeliveryDto, method, setting_spec,
     setting_value_kind, value_to_daemon_config,
 };
 use gpui::{Context, SharedString};
@@ -68,6 +68,7 @@ pub struct SettingsStore {
     port: Arc<dyn SettingsPort>,
     daemon: DaemonConfigSnapshot,
     gateway: GatewayStatusDto,
+    shell: ShellStatusDto,
     preferences: AgentPreferencesDto,
     sync: SyncStatusDto,
     queues: Vec<QueueDto>,
@@ -111,6 +112,7 @@ impl SettingsStore {
             port,
             daemon: DaemonConfigSnapshot::default(),
             gateway: GatewayStatusDto::default(),
+            shell: ShellStatusDto::default(),
             preferences: AgentPreferencesDto::default(),
             sync: SyncStatusDto::default(),
             queues: Vec::new(),
@@ -145,6 +147,7 @@ impl SettingsStore {
     pub fn replace_snapshot(&mut self, snapshot: &AgentSnapshot, cx: &mut Context<Self>) {
         self.daemon.clone_from(&snapshot.daemon.config);
         self.gateway.clone_from(&snapshot.gateway);
+        self.shell.clone_from(&snapshot.shell);
         self.preferences.clone_from(&snapshot.preferences);
         self.sync.clone_from(&snapshot.sync);
         self.queues.clone_from(&snapshot.daemon.queues);
@@ -182,6 +185,7 @@ impl SettingsStore {
                 self.webhook_deliveries.clone_from(deliveries)
             }
             AgentEvent::GatewayChanged(gateway) => self.gateway.clone_from(gateway),
+            AgentEvent::ShellChanged(shell) => self.shell.clone_from(shell),
             AgentEvent::PreferencesChanged(preferences) => {
                 self.preferences.clone_from(preferences);
                 self.overlay_local_edits();
@@ -244,6 +248,11 @@ impl SettingsStore {
     #[must_use]
     pub fn gateway(&self) -> &GatewayStatusDto {
         &self.gateway
+    }
+    /// agent 托盘可用性与关闭 UI 后的驻留策略。
+    #[must_use]
+    pub fn shell(&self) -> &ShellStatusDto {
+        &self.shell
     }
     #[must_use]
     pub fn sync_status(&self) -> &SyncStatusDto {

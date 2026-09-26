@@ -14,6 +14,8 @@ use crate::service::DaemonService;
 pub struct SessionReply {
     pub response: RpcResponse,
     pub became_ready: bool,
+    /// 已受理 `system.shutdown`：传输层发出响应后应让整个 daemon 退出。
+    pub shutdown_requested: bool,
 }
 
 /// 单条 WebSocket 连接的握手状态。
@@ -45,49 +47,48 @@ impl RpcSession {
         self.ready
     }
 
-    /// 解析一条文本帧。首帧只能是兼容的 `system.hello`。
+    /// 解析一条文本帧。首帧只能是兼容的 `system.hello` 或 `system.shutdown`。
     pub async fn handle_text(&mut self, text: &str) -> SessionReply {
         let request = match serde_json::from_str::<RpcRequest>(text) {
             Ok(request) => request,
             Err(error) => {
-                return SessionReply {
-                    response: RpcResponse::parse_failure(error.to_string()),
-                    became_ready: false,
-                };
+                return SessionReply::reply(RpcResponse::parse_failure(error.to_string()));
             }
         };
+        // 握手前也受理：版本不兼容的新 agent 需要让旧 daemon 退出后再拉起同版本进程。
+        if request.method == fluxdown_protocol::method::SYSTEM_SHUTDOWN
+            && request.validate().is_ok()
+        {
+            return SessionReply {
+                response: RpcResponse::success(request.id, serde_json::json!({ "ok": true })),
+                became_ready: false,
+                shutdown_requested: true,
+            };
+        }
         if !self.ready {
             return self.handle_hello(request);
         }
         let id = request.id.clone();
         if let Err(data) = request.validate() {
-            return SessionReply {
-                response: RpcResponse::failure(
-                    id,
-                    RpcErrorObject::application("invalid JSON-RPC version", data),
-                ),
-                became_ready: false,
-            };
+            return SessionReply::reply(RpcResponse::failure(
+                id,
+                RpcErrorObject::application("invalid JSON-RPC version", data),
+            ));
         }
         if request.method == fluxdown_protocol::method::SYSTEM_HELLO {
-            return SessionReply {
-                response: RpcResponse::failure(
-                    id,
-                    RpcErrorObject::application(
-                        "system.hello is only valid as the first frame",
-                        RpcErrorData::new(ApplicationErrorCode::Conflict, false),
-                    ),
+            return SessionReply::reply(RpcResponse::failure(
+                id,
+                RpcErrorObject::application(
+                    "system.hello is only valid as the first frame",
+                    RpcErrorData::new(ApplicationErrorCode::Conflict, false),
                 ),
-                became_ready: false,
-            };
+            ));
         }
-        SessionReply {
-            response: self
-                .service
+        SessionReply::reply(
+            self.service
                 .call(&self.connection_id, self.is_local_agent, request)
                 .await,
-            became_ready: false,
-        }
+        )
     }
 
     /// 连接断开时释放连接所有权选择订阅。
@@ -105,26 +106,31 @@ impl RpcSession {
                     SessionReply {
                         response: RpcResponse::success(id, result),
                         became_ready: true,
+                        shutdown_requested: false,
                     }
                 }
-                Err(error) => SessionReply {
-                    response: RpcResponse::failure(
-                        id,
-                        RpcErrorObject::application(
-                            error.to_string(),
-                            RpcErrorData::new(ApplicationErrorCode::Internal, false),
-                        ),
-                    ),
-                    became_ready: false,
-                },
-            },
-            Err(data) => SessionReply {
-                response: RpcResponse::failure(
+                Err(error) => SessionReply::reply(RpcResponse::failure(
                     id,
-                    RpcErrorObject::application("hello rejected", data),
-                ),
-                became_ready: false,
+                    RpcErrorObject::application(
+                        error.to_string(),
+                        RpcErrorData::new(ApplicationErrorCode::Internal, false),
+                    ),
+                )),
             },
+            Err(data) => SessionReply::reply(RpcResponse::failure(
+                id,
+                RpcErrorObject::application("hello rejected", data),
+            )),
+        }
+    }
+}
+
+impl SessionReply {
+    fn reply(response: RpcResponse) -> Self {
+        Self {
+            response,
+            became_ready: false,
+            shutdown_requested: false,
         }
     }
 }

@@ -1,19 +1,36 @@
 //! 「新建下载」表单：字段、顺序与提交语义与
 //! `lib/src/widgets/new_download_dialog.dart` 逐条对齐；纯规则见
 //! [`crate::model::new_download`]。
+//!
+//! 浏览器扩展 / NMH 的外部捕获也在本表单确认：捕获条目以链接行呈现（可与手填链接混合），
+//! 提交时经 `agent.capture.resolve` 确认，Cookie / 请求头 / 请求体等上下文由 agent 合并；
+//! 未确认的捕获在窗口关闭时一并忽略。
 
-use std::{collections::HashMap, path::PathBuf, rc::Rc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::{
+    controller::{
+        DownloadsCommand, DownloadsPort, DownloadsResult, LAST_SAVE_DIR_PREF,
+        REMEMBER_LAST_SAVE_DIR_PREF,
+    },
     model::new_download::{
         DEFAULT_HASH_ALGORITHM, DraftOptions, HASH_ALGORITHMS, MAX_THREADS, ProxyChoice,
         THREAD_PRESETS, ThreadChoice, UA_PRESET_CUSTOM, UA_PRESET_DEFAULT, UrlEntry,
-        build_requests, checksum_spec, custom_segments, detect_ua_preset, merge_imported,
-        parse_entries, ua_preset_keys, ua_preset_value,
+        append_entries, build_requests, checksum_spec, custom_segments, detect_ua_preset,
+        manual_proxy_url, merge_imported, parse_entries, ua_preset_keys, ua_preset_value,
     },
     strings::NewDownloadStrings,
 };
-use fluxdown_protocol::CreateTaskRequest;
+use fluxdown_protocol::{
+    AgentSnapshot, CaptureResolveParams, CreateTaskRequest, PendingCaptureDto, QueueDto,
+    SiteAuthCredentialDto,
+};
 use fluxdown_ui_components::{
     ControlExt as _, FluxIcon, IconControlExt as _, field_error, field_hint, field_label, form,
     form_field, form_gap, form_row, input_with_action, option_group, option_row,
@@ -43,6 +60,8 @@ const CUSTOM_THREADS_WIDTH: Pixels = px(96.);
 const PRESET_DROPDOWN_WIDTH: Pixels = px(140.);
 /// 请求头名称列宽。
 const HEADER_NAME_WIDTH: Pixels = px(168.);
+/// 链接停止变化多久后才查询站点凭据（逐键输入时不逐字符发 RPC）。
+const SITE_AUTH_LOOKUP_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// 队列下拉候选（显示名由表单按内置队列本地化）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,19 +83,145 @@ pub struct NewDownloadContext {
     pub queues: Vec<NewDownloadQueue>,
     /// 全局手动代理 URL；空 = 未配置（对应下拉项置灰）。
     pub manual_proxy_url: String,
-    /// 预填链接（拖放 / 捕获「更多选项」）。
+    /// 预填链接（拖放）。
     pub initial_urls: Vec<String>,
-    /// 预填文件名（仅单链接时有意义）。
-    pub initial_file_name: String,
+}
+
+/// 从 agent 快照投影「新建下载」环境（无主窗口时的外部捕获确认、菜单入口共用规则）。
+#[must_use]
+pub fn new_download_context_from_snapshot(snapshot: &AgentSnapshot) -> NewDownloadContext {
+    build_new_download_context(
+        &snapshot.daemon.config.values,
+        &snapshot.daemon.runtime_stats.save_dir,
+        &snapshot.preferences.values,
+        &snapshot.daemon.queues,
+        None,
+    )
+}
+
+/// 与 Dart 一致：偏好 `remember_last_save_dir` 开启且有记录时沿用上次目录，否则用全局
+/// 默认（`default_save_dir`，空则 daemon 运行时目录）；队列优先 `selected_queue`，其次配置
+/// `default_queue_id`，最后主队列；线程数优先队列 `default_segments`，其次全局配置。
+pub(crate) fn build_new_download_context(
+    config: &BTreeMap<String, String>,
+    runtime_save_dir: &str,
+    preferences: &BTreeMap<String, serde_json::Value>,
+    queues: &[QueueDto],
+    selected_queue: Option<&str>,
+) -> NewDownloadContext {
+    let config_str = |key: &str| config.get(key).map_or("", |value| value.trim());
+    let remember = preferences
+        .get(REMEMBER_LAST_SAVE_DIR_PREF)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let last_save_dir = preferences
+        .get(LAST_SAVE_DIR_PREF)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let save_dir = if remember && !last_save_dir.is_empty() {
+        last_save_dir
+    } else {
+        match config_str("default_save_dir") {
+            "" => runtime_save_dir,
+            configured => configured,
+        }
+    };
+    let queue_id = selected_queue.unwrap_or_else(|| match config_str("default_queue_id") {
+        "" => fluxdown_protocol::MAIN_QUEUE_ID,
+        configured => configured,
+    });
+    let queue_segments = queues
+        .iter()
+        .find(|queue| queue.queue_id == queue_id)
+        .map_or(0, |queue| queue.default_segments);
+    let segments = if queue_segments > 0 {
+        queue_segments
+    } else {
+        config_str("default_segments").parse::<i32>().unwrap_or(0)
+    };
+    NewDownloadContext {
+        save_dir: save_dir.to_owned(),
+        queue_id: queue_id.to_owned(),
+        segments,
+        queues: queues
+            .iter()
+            .map(|queue| NewDownloadQueue {
+                id: queue.queue_id.clone(),
+                name: queue.name.clone(),
+            })
+            .collect(),
+        manual_proxy_url: manual_proxy_url(config),
+        initial_urls: Vec::new(),
+    }
+}
+
+/// 外部捕获条目的确认：事务 id + 表单产出的建任务参数。
+#[derive(Clone, Debug)]
+pub struct CapturedTask {
+    pub transaction_id: String,
+    pub request: CreateTaskRequest,
 }
 
 /// 表单确认后的提交内容。
 #[derive(Clone, Debug)]
 pub enum NewDownloadSubmission {
-    /// 每条链接一个请求，共享表单选项；宿主逐条调用 `daemon.task.create`。
-    Tasks(Vec<CreateTaskRequest>),
+    /// 每条链接一个请求，共享表单选项：普通链接逐条 `daemon.task.create`，
+    /// 外部捕获条目逐条 `agent.capture.resolve` 确认。
+    Tasks {
+        tasks: Vec<CreateTaskRequest>,
+        captures: Vec<CapturedTask>,
+    },
     /// 本机 `.torrent` 文件，交给 agent 读取上传。
     TorrentFiles(Vec<PathBuf>),
+}
+
+impl NewDownloadSubmission {
+    /// 「上次保存目录」偏好写入（尽力而为，失败不影响建任务）。
+    #[must_use]
+    pub fn remember_save_dir_command(&self) -> Option<DownloadsCommand> {
+        let Self::Tasks { tasks, captures } = self else {
+            return None;
+        };
+        let save_dir = tasks
+            .first()
+            .or_else(|| captures.first().map(|capture| &capture.request))?
+            .save_dir
+            .clone();
+        Some(DownloadsCommand::SetLocalPreference {
+            key: LAST_SAVE_DIR_PREF,
+            value: serde_json::Value::String(save_dir),
+        })
+    }
+
+    /// 建任务 / 确认捕获 / 上传种子的端口命令，逐条执行。
+    #[must_use]
+    pub fn into_commands(self) -> Vec<DownloadsCommand> {
+        match self {
+            Self::Tasks { tasks, captures } => tasks
+                .into_iter()
+                .map(|request| {
+                    DownloadsCommand::Create(Box::new(fluxdown_protocol::DaemonCreateTaskParams {
+                        request,
+                        torrent_blob_id: None,
+                        unattended: false,
+                    }))
+                })
+                .chain(captures.into_iter().map(|capture| {
+                    DownloadsCommand::CaptureResolve(Box::new(CaptureResolveParams {
+                        transaction_id: capture.transaction_id,
+                        accepted: true,
+                        request: Some(capture.request),
+                    }))
+                }))
+                .collect(),
+            Self::TorrentFiles(paths) => paths
+                .iter()
+                .map(|path| DownloadsCommand::SubmitTorrentFile {
+                    path: path.display().to_string(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// 新建下载对话框的提交回调。
@@ -88,16 +233,30 @@ struct HeaderRow {
     value: Entity<InputState>,
 }
 
+/// HTTP 认证框的站点凭据自动回填状态（规则同 Dart `_maybeAutofillSiteAuth`）。
+#[derive(Default)]
+struct AuthAutofill {
+    /// 两框当前值来自站点凭据自动回填（链接换站点时可被更新 / 清空）。
+    filled: bool,
+    /// 用户手动编辑过认证框：此后本表单不再自动覆盖。
+    dirty: bool,
+    /// 当前回填目标链接（单条 http(s) 且不沿用浏览器认证时才有）。
+    target: Option<String>,
+}
+
 /// 独立窗口承载的「新建下载」表单。
 ///
-/// 提交或取消都会关闭自身所在窗口；任务创建失败的提示由
-/// [`super::downloads::DownloadView`] 展示。
+/// 提交或取消都会关闭自身所在窗口；任务创建失败的提示由宿主展示。视图释放时仍未确认的
+/// 外部捕获由宿主经 [`Self::take_captures`] 取走并忽略。
 pub struct NewDownloadView {
     strings: NewDownloadStrings,
     context: NewDownloadContext,
+    port: Arc<dyn DownloadsPort>,
     on_submit: NewDownloadSubmit,
     urls: Entity<TextareaState>,
     entries: Vec<UrlEntry>,
+    /// 尚未确认 / 忽略的外部捕获；按 URL 与链接行对应。
+    captures: Vec<PendingCaptureDto>,
     save_dir: Entity<InputState>,
     threads: ThreadChoice,
     custom_threads: Entity<InputState>,
@@ -106,6 +265,7 @@ pub struct NewDownloadView {
     http_user: Entity<InputState>,
     http_password: Entity<InputState>,
     save_site_auth: bool,
+    auth_autofill: AuthAutofill,
     proxy_choice: ProxyChoice,
     custom_proxy: Entity<InputState>,
     ignore_tls_errors: bool,
@@ -120,10 +280,11 @@ pub struct NewDownloadView {
 }
 
 impl NewDownloadView {
-    /// 创建表单并聚焦链接输入框。
+    /// 创建表单并聚焦链接输入框。`port` 用于站点凭据匹配。
     pub fn new(
         translator: Entity<Translator>,
         context: NewDownloadContext,
+        port: Arc<dyn DownloadsPort>,
         on_submit: NewDownloadSubmit,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -157,11 +318,8 @@ impl NewDownloadView {
         let cookie = cx.new(|cx| {
             TextareaState::new(window, cx).placeholder(strings.cookie_placeholder.clone())
         });
-        let rename = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(context.initial_file_name.clone())
-                .placeholder(strings.rename_placeholder.clone())
-        });
+        let rename = cx
+            .new(|cx| InputState::new(window, cx).placeholder(strings.rename_placeholder.clone()));
         urls.update(cx, |input, cx| input.focus(window, cx));
 
         let mut this = Self {
@@ -173,14 +331,17 @@ impl NewDownloadView {
             checksum: Self::input(strings.checksum_placeholder.clone(), window, cx),
             strings,
             context,
+            port,
             on_submit,
             urls,
             entries: Vec::new(),
+            captures: Vec::new(),
             save_dir,
             custom_threads,
             advanced_open: false,
             http_password,
             save_site_auth: false,
+            auth_autofill: AuthAutofill::default(),
             proxy_choice: ProxyChoice::FollowGlobal,
             ignore_tls_errors: false,
             ua_preset: UA_PRESET_DEFAULT,
@@ -190,7 +351,7 @@ impl NewDownloadView {
             header_seq: 0,
             picking: false,
         };
-        this.refresh_entries(cx);
+        this.refresh_entries(window, cx);
         this.subscribe_inputs(&translator, window, cx);
         this
     }
@@ -220,7 +381,7 @@ impl NewDownloadView {
             &self.urls,
             window,
             |this, _, event: &InputEvent, window, cx| match event {
-                InputEvent::Change => this.refresh_entries(cx),
+                InputEvent::Change => this.refresh_entries(window, cx),
                 InputEvent::PressEnter {
                     secondary: true, ..
                 } => this.submit(false, None, window, cx),
@@ -252,11 +413,183 @@ impl NewDownloadView {
             }
         })
         .detach();
+        // `set_value`（自动回填）不发 Change：这里只会收到用户手动编辑。
+        for input in [&self.http_user, &self.http_password] {
+            cx.subscribe(input, |this, _, event: &InputEvent, _| {
+                if let InputEvent::Change = event {
+                    this.auth_autofill.dirty = true;
+                    this.auth_autofill.filled = false;
+                }
+            })
+            .detach();
+        }
     }
 
-    fn refresh_entries(&mut self, cx: &mut Context<Self>) {
+    fn refresh_entries(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.entries = parse_entries(&self.urls.read(cx).value(), false);
+        self.sync_site_auth(window, cx);
         cx.notify();
+    }
+
+    /// 追加外部捕获：未见过的事务按链接行（含 `out=` 文件名）追加到链接框末尾，不改动
+    /// 已有文本；表单原本为空时沿用捕获方指定的保存目录。
+    pub fn add_captures(
+        &mut self,
+        captures: Vec<PendingCaptureDto>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fresh = captures
+            .into_iter()
+            .filter(|capture| {
+                !self
+                    .captures
+                    .iter()
+                    .any(|known| known.transaction_id == capture.transaction_id)
+            })
+            .collect::<Vec<_>>();
+        if fresh.is_empty() {
+            return;
+        }
+        let current = self.urls.read(cx).value().to_string();
+        if current.trim().is_empty()
+            && let Some(save_dir) = fresh
+                .iter()
+                .map(|capture| capture.save_dir.trim())
+                .find(|save_dir| !save_dir.is_empty())
+        {
+            let save_dir = save_dir.to_owned();
+            self.save_dir
+                .update(cx, |input, cx| input.set_value(save_dir, window, cx));
+        }
+        let text = append_entries(
+            &current,
+            fresh.iter().map(|capture| UrlEntry {
+                url: capture.url.clone(),
+                file_name: capture.file_name.clone(),
+                checksum: String::new(),
+            }),
+        );
+        self.urls
+            .update(cx, |input, cx| input.set_value(text, window, cx));
+        self.captures.extend(fresh);
+        self.refresh_entries(window, cx);
+    }
+
+    /// 只保留 agent 仍在等待确认的捕获（其余已在别处处理 / agent 重启丢失）；对应链接行
+    /// 保留为普通链接。
+    pub fn retain_captures(
+        &mut self,
+        pending: &[PendingCaptureDto],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.captures.len();
+        self.captures.retain(|capture| {
+            pending
+                .iter()
+                .any(|pending| pending.transaction_id == capture.transaction_id)
+        });
+        if self.captures.len() != before {
+            self.refresh_entries(window, cx);
+        }
+    }
+
+    fn capture_for(&self, url: &str) -> Option<&PendingCaptureDto> {
+        self.captures.iter().find(|capture| capture.url == url)
+    }
+
+    /// 单条链接且是带 `Authorization` 的浏览器捕获：沿用浏览器认证，不回填站点凭据。
+    fn uses_browser_auth(&self) -> bool {
+        matches!(self.entries.as_slice(), [entry]
+            if self.capture_for(&entry.url).is_some_and(PendingCaptureDto::has_authorization))
+    }
+
+    /// 站点凭据回填目标：单条 http(s) 链接，且不沿用浏览器认证。
+    fn site_auth_target(&self) -> Option<String> {
+        let [entry] = self.entries.as_slice() else {
+            return None;
+        };
+        let lower = entry.url.to_ascii_lowercase();
+        let http = lower.starts_with("http://") || lower.starts_with("https://");
+        (http && !self.uses_browser_auth()).then(|| entry.url.clone())
+    }
+
+    /// 链接变化后按站点键查已保存凭据并回填 / 更新 / 清空认证两框（用户手动编辑过则不动）。
+    /// 查询去抖；结果回来时目标已变则丢弃。
+    fn sync_site_auth(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.auth_autofill.dirty {
+            return;
+        }
+        let target = self.site_auth_target();
+        if target == self.auth_autofill.target {
+            return;
+        }
+        self.auth_autofill.target.clone_from(&target);
+        let Some(url) = target else {
+            self.clear_autofilled_auth(window, cx);
+            return;
+        };
+        let port = self.port.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(SITE_AUTH_LOOKUP_DEBOUNCE)
+                .await;
+            let current = this
+                .read_with(cx, |this, _| {
+                    this.auth_autofill.target.as_deref() == Some(url.as_str())
+                })
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
+            let credential = match port
+                .execute(DownloadsCommand::SiteAuthMatch { url: url.clone() })
+                .await
+            {
+                Ok(DownloadsResult::Value(value)) => {
+                    serde_json::from_value::<Option<SiteAuthCredentialDto>>(value)
+                        .ok()
+                        .flatten()
+                }
+                _ => None,
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.auth_autofill.dirty
+                    || this.auth_autofill.target.as_deref() != Some(url.as_str())
+                {
+                    return;
+                }
+                match credential {
+                    Some(credential) => {
+                        this.http_user
+                            .update(cx, |input, cx| input.set_value(credential.user, window, cx));
+                        this.http_password
+                            .update(cx, |input, cx| input.set_value(credential.pass, window, cx));
+                        this.auth_autofill.filled = true;
+                        cx.notify();
+                    }
+                    None => this.clear_autofilled_auth(window, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn clear_autofilled_auth(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.auth_autofill.filled {
+            return;
+        }
+        for input in [&self.http_user, &self.http_password] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.auth_autofill.filled = false;
+        cx.notify();
+    }
+
+    /// 取走仍未确认的外部捕获（宿主在视图释放时忽略它们，agent 不留悬挂事务）。
+    pub fn take_captures(&mut self) -> Vec<PendingCaptureDto> {
+        std::mem::take(&mut self.captures)
     }
 
     fn is_batch(&self) -> bool {
@@ -340,8 +673,22 @@ impl NewDownloadView {
             return;
         }
         let options = self.draft_options(later, queue_override, cx);
-        let requests = build_requests(&self.entries, &options);
-        (self.on_submit)(NewDownloadSubmission::Tasks(requests), window, cx);
+        let mut tasks = Vec::new();
+        let mut captures = Vec::new();
+        for request in build_requests(&self.entries, &options) {
+            match self
+                .captures
+                .iter()
+                .position(|capture| capture.url == request.url)
+            {
+                Some(index) => captures.push(CapturedTask {
+                    transaction_id: self.captures.remove(index).transaction_id,
+                    request,
+                }),
+                None => tasks.push(request),
+            }
+        }
+        (self.on_submit)(NewDownloadSubmission::Tasks { tasks, captures }, window, cx);
         window.remove_window();
     }
 
@@ -427,7 +774,7 @@ impl NewDownloadView {
                 let merged = merge_imported(&this.urls.read(cx).value(), imported);
                 this.urls
                     .update(cx, |input, cx| input.set_value(merged, window, cx));
-                this.refresh_entries(cx);
+                this.refresh_entries(window, cx);
                 window.push_notification(
                     Notification::success(this.strings.format_import_found(count)),
                     cx,
@@ -697,6 +1044,9 @@ impl NewDownloadView {
             .when(has_text && count == 0, |this| {
                 this.child(field_error(self.strings.no_valid_url.clone(), cx))
             })
+            .when(!self.captures.is_empty(), |this| {
+                this.child(field_hint(self.strings.capture_context_hint.clone(), cx))
+            })
             .child(
                 h_flex()
                     .gap(spacing.sm)
@@ -822,7 +1172,11 @@ impl NewDownloadView {
                 ],
                 cx,
             ),
-            Some(self.strings.http_auth_desc.clone()),
+            Some(if self.uses_browser_auth() {
+                self.strings.capture_auth_hint.clone()
+            } else {
+                self.strings.http_auth_desc.clone()
+            }),
             cx,
         )
     }

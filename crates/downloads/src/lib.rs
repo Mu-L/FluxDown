@@ -20,6 +20,5 @@ pub use pages::downloads::*;
 pub use pages::group_detail::*;
 pub use pages::new_download::*;
 pub use pages::queue_manager::*;
-pub use pages::quick_capture::*;
 pub use pages::selection::*;
 pub use pages::task_detail::*;

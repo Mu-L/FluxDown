@@ -1717,10 +1717,10 @@ pub struct SiteAuthEntryDto {
 }
 
 /// 单站点 HTTP Basic 凭据详情；仅由受保护的定向查询返回（`GET
-/// /api/v1/site-auth/{site}`，须管理 token）。`pass` 是明文密码，不脱敏
-/// ——保留是为了编辑表单可以回填原值；只应用于「打开编辑对话框」这类需要
-/// 原文的场景，不要在列表/日志里回显（L-1；列表接口 [`SiteAuthEntryDto`]
-/// 本就不含 `pass`）。
+/// /api/v1/site-auth/{site}`，须管理 token；本机 RPC `daemon.siteAuth.match`）。
+/// `pass` 是明文密码，不脱敏——保留是为了表单可以回填原值；只应用于编辑对话框 /
+/// 新建下载认证框这类需要原文的场景，不要在列表/日志里回显（L-1；列表接口
+/// [`SiteAuthEntryDto`] 本就不含 `pass`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
@@ -1746,6 +1746,15 @@ pub struct SiteAuthSaveRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SiteAuthDeleteParams {
     pub site: String,
+}
+
+/// `daemon.siteAuth.match` 参数：按下载链接的站点键（`host` / `host:port`，与引擎
+/// 自动套用规则同一实现）查已保存凭据；结果为 [`SiteAuthCredentialDto`] 或 `null`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SiteAuthMatchParams {
+    pub url: String,
 }
 
 /// 引擎学习到的按域连接上限摘要（`daemon.config.connPolicy`）。

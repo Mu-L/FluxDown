@@ -1,5 +1,6 @@
 //! 通用：启动与托盘、系统集成、侧边栏与活动栏可见性、自定义分类。
 
+use fluxdown_protocol::{ShellStatusDto, TrayUnavailableReason};
 use fluxdown_ui_components::FluxIcon;
 use gpui::App;
 
@@ -28,6 +29,8 @@ pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingsPage {
 }
 
 fn startup_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
+    // 托盘由 agent 承载：可用性在运行期探测（Linux 取决于 StatusNotifier 宿主与 appindicator）。
+    let shell = ctx.store.read(cx).shell().clone();
     SettingsSection::new()
         .title(ctx.t("settingsGroupStartupTray"))
         .row(
@@ -41,29 +44,29 @@ fn startup_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
         .row(
             ctx.item(
                 "closeToTray",
-                Some(tray_desc("closeToTrayDesc")),
+                Some(tray_desc(&shell, "closeToTrayDesc")),
                 ctx.pref_switch("close_to_tray", true),
             )
-            .disabled(!TRAY_SUPPORTED),
+            .disabled(!shell.tray_available),
         )
         .row(
             ctx.item(
                 "startMinimizedToTray",
-                Some(tray_desc("startMinimizedToTrayDesc")),
+                Some(tray_desc(&shell, "startMinimizedToTrayDesc")),
                 ctx.pref_switch("start_minimized_to_tray", false),
             )
-            .disabled(!TRAY_SUPPORTED),
+            .disabled(!shell.tray_available),
         )
 }
 
-/// 托盘仅 Windows / macOS 提供（GPUI 端 Linux 不做托盘，关窗即退出）。
-const TRAY_SUPPORTED: bool = cfg!(any(windows, target_os = "macos"));
-
-fn tray_desc(key: &'static str) -> &'static str {
-    if TRAY_SUPPORTED {
-        key
-    } else {
-        "trayUnsupportedLinux"
+/// 托盘不可用时用原因替换说明文案，告诉用户关闭窗口后会发生什么。
+fn tray_desc(shell: &ShellStatusDto, key: &'static str) -> &'static str {
+    match shell.tray_unavailable_reason {
+        None => key,
+        Some(TrayUnavailableReason::NotBuilt) => "trayUnavailableNotBuilt",
+        Some(TrayUnavailableReason::NoDisplay) => "trayUnavailableNoDisplay",
+        Some(TrayUnavailableReason::NoHost) => "trayUnavailableNoHost",
+        Some(TrayUnavailableReason::InitFailed) => "trayUnavailableInitFailed",
     }
 }
 

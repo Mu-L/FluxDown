@@ -1,7 +1,7 @@
 //! 完成后关机：跨 `downloads` / `app` 边界的最小共享契约。
 //!
-//! 状态机与实际关机执行由 app 侧 `power::ShutdownScheduler` 拥有；本文件只定义
-//! 状态栏渲染与请求发起所需的类型，避免 `downloads` 依赖 `app`。
+//! 状态机与实际关机执行归 agent（`agent.power.*` / `PowerChanged`），app 侧 `power` 只做
+//! 投影与请求转发；本文件只定义状态栏渲染与请求发起所需的类型，避免 `downloads` 依赖 `app`。
 
 use std::{cell::Cell, rc::Rc, time::Duration};
 
@@ -23,8 +23,8 @@ pub struct ShutdownStatus {
     pub countdown_remaining: Option<Duration>,
 }
 
-/// 跨窗口共享的关机状态（Resident 侧写，任意窗口只读渲染）。
+/// 跨窗口共享的关机状态（app 从 agent 快照投影写入，任意窗口只读渲染）。
 pub type SharedShutdownStatus = Rc<Cell<ShutdownStatus>>;
 
-/// 状态栏发起关机请求的端口（由 Resident 在主窗口装配时注入）。
+/// 状态栏发起关机请求的端口（由 app 在主窗口装配时注入，转成 `agent.power.*`）。
 pub type ShutdownPort = Rc<dyn Fn(ShutdownRequest, &mut gpui::App)>;

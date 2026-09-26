@@ -37,9 +37,6 @@ fluxdown_ui_components = { version = "0.1.0", path = "../components" }
 [target.'cfg(windows)'.build-dependencies]
 winresource.workspace = true
 
-[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
-tray-icon = "0.24.2"
-
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSRunningApplication", "NSDockTile", "NSImage", "NSImageView", "NSView", "NSResponder", "NSControl", "NSCell"] }

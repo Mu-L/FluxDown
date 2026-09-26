@@ -12,6 +12,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"], optional = true }
 async-trait = "0.1.89"
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.22"
@@ -20,24 +21,48 @@ directories = "6"
 ed25519-dalek = "3.0.0"
 fluxdown_api = { version = "0.1.0", path = "../api" }
 fluxdown_protocol = { path = "../protocol" }
+fluxdown_ui_i18n = { version = "0.1.0", path = "../../crates/i18n", optional = true }
 fs2 = "0.4.3"
 futures-util = "0.3.32"
 hkdf = "0.12"
+image = { version = "0.25.10", default-features = false, features = ["png"], optional = true }
 keepawake = "0.6"
 mdns-sd = "0.20.2"
-notify-rust = "4.11"
 rand = "0.9"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
+tao = { version = "0.37", default-features = false, optional = true }
 thiserror = "2"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "signal", "net", "io-util", "fs", "time", "process"] }
 tokio-tungstenite = "0.29"
 tokio-util = { version = "0.7.18", features = ["io"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+tray-icon = { version = "0.24.2", default-features = false, features = ["gtk"], optional = true }
 uuid = { version = "1.23.4", features = ["v4", "serde"] }
 x25519-dalek = { version = "3", features = ["static_secrets", "zeroize"] }
 
+# macOS 通知经系统 osascript 投递（见 src/notification.rs）：notify-rust 的 macOS 后端走
+# 已被新版系统拒收的 NSUserNotification，只在 Windows / Linux 使用。
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify-rust = "4.11"
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
+
+[features]
+# 桌面外壳集成：托盘（tao 事件循环 + tray-icon）、剪贴板监听、托盘文案 i18n。
+# 官方桌面包（desktop-dev / GPUI 打包流水线）开启；headless 构建关闭，此时关闭全部 UI
+# 后后台恒驻留。Linux 开启后运行期需要 GTK3 与 (ayatana-)appindicator。
+desktop = [
+    "dep:tao",
+    "dep:tray-icon",
+    "dep:image",
+    "dep:arboard",
+    "dep:fluxdown_ui_i18n",
+    "dep:gtk",
+]

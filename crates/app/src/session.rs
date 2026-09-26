@@ -1,9 +1,14 @@
 //! 单一 agent 会话实体：所有快照 / 事件的唯一入口，向任意数量窗口的任意能力视图广播。
 //!
-//! 视图通过 [attach] 订阅：从持续折叠的同源快照秒开首帧，后续沿单会话
+//! 视图通过 [attach] 订阅：从持续折叠的同源快照秒开首帧，后续沿单会话
 //! 的严格事件游标更新；订阅随视图销毁自动解除。
+//!
+//! 连接态对视图有宽限：启动时首个快照、断线后的重连快照只要在 [`OFFLINE_NOTICE_GRACE`]
+//! 内到达，视图就不会进入「正在连接」只读态（期间发出的命令由客户端排队，重连后送达）。
+//! 超过宽限仍未连上才广播 [`SessionSignal::Stale`]。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use fluxdown_protocol::{
     AgentEvent, AgentSnapshot, DaemonEvent, EventFrame, RpcErrorData, ServiceEvent, Snapshot,
@@ -13,35 +18,50 @@ use gpui::{App, Context, Entity, EventEmitter};
 
 use crate::agent_client::{AgentClient, AgentClientEvent};
 
+/// 断线（含启动时尚未连上）多久仍未恢复才告知视图。本机回环重连与热启动首个快照都远低于
+/// 此值；冷启动（需拉起 agent 与 daemon）超过它时才显示连接态。
+const OFFLINE_NOTICE_GRACE: Duration = Duration::from_millis(800);
+
 /// 会话向订阅者广播的信号。
 pub enum SessionSignal {
     /// 连接 / 重连后的全量快照。
     Snapshot(Arc<Snapshot>),
     /// 单个事件帧。
     Event(Arc<EventFrame>),
-    /// 连接断开，等待重连。
+    /// 连接断开超过宽限仍未恢复，视图进入只读的「正在连接」态。
     Stale,
     /// 不可恢复错误（协议不兼容 / 未授权）。
     Fatal(RpcErrorData),
+    /// agent 已完全退出（`system.shutdown`）：界面应随之退出。
+    ServiceStopped,
 }
 
 /// agent 会话状态：最近一次全量快照与连接健康度。
 pub struct AgentSession {
     _client: Arc<AgentClient>,
     latest: Option<Arc<Snapshot>>,
+    /// 连接当前不可用（事件帧不再并入快照）。
     stale: bool,
+    /// 已向视图广播离线（宽限已过或不可恢复）。
+    offline_notified: bool,
+    /// 宽限计时器代际：新快照到达即作废在途计时。
+    offline_generation: u64,
 }
 
 impl EventEmitter<SessionSignal> for AgentSession {}
 
 impl AgentSession {
-    #[must_use]
-    pub fn new(client: Arc<AgentClient>) -> Self {
-        Self {
+    /// 创建会话并开始启动宽限计时：首个快照在宽限内到达则视图全程不见连接态。
+    pub fn new(client: Arc<AgentClient>, cx: &mut Context<Self>) -> Self {
+        let mut session = Self {
             _client: client,
             latest: None,
             stale: true,
-        }
+            offline_notified: false,
+            offline_generation: 0,
+        };
+        session.schedule_offline_notice(cx);
+        session
     }
 
     /// 最近一次同源完整投影（已折叠有序事件）。
@@ -56,6 +76,12 @@ impl AgentSession {
         self.latest.as_deref().and_then(agent_body)
     }
 
+    /// 已可呈现界面：拿到快照，或已确认离线（宽限已过 / 不可恢复），不必再等。
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        self.latest.is_some() || self.offline_notified
+    }
+
     /// 把一批客户端事件逐个转为 [`SessionSignal`] 广播。
     pub fn ingest(&mut self, events: Vec<AgentClientEvent>, cx: &mut Context<Self>) {
         for event in events {
@@ -64,6 +90,8 @@ impl AgentSession {
                     let snapshot = Arc::new(*snapshot);
                     self.latest = Some(Arc::clone(&snapshot));
                     self.stale = false;
+                    self.offline_notified = false;
+                    self.offline_generation = self.offline_generation.wrapping_add(1);
                     cx.emit(SessionSignal::Snapshot(snapshot));
                 }
                 AgentClientEvent::Event(mut frame) => {
@@ -76,27 +104,56 @@ impl AgentSession {
                             cx.emit(SessionSignal::Event(Arc::new(*frame)));
                         }
                         Some(Ok(_)) => {}
-                        _ => {
-                            self.mark_stale();
-                            cx.emit(SessionSignal::Stale);
-                        }
+                        _ => self.go_stale(cx),
                     }
                 }
-                AgentClientEvent::Stale => {
-                    self.mark_stale();
-                    cx.emit(SessionSignal::Stale);
-                }
+                AgentClientEvent::Stale => self.go_stale(cx),
                 AgentClientEvent::Fatal(error) => {
-                    self.mark_stale();
+                    self.notify_offline_now();
                     cx.emit(SessionSignal::Fatal(error));
+                }
+                AgentClientEvent::ServiceStopped => {
+                    self.notify_offline_now();
+                    cx.emit(SessionSignal::ServiceStopped);
                 }
             }
         }
         cx.notify();
     }
 
-    fn mark_stale(&mut self) {
+    /// 连接中断：立即停止并帧，但只在宽限内仍未恢复时才告知视图。
+    fn go_stale(&mut self, cx: &mut Context<Self>) {
+        if self.stale {
+            return;
+        }
         self.stale = true;
+        self.schedule_offline_notice(cx);
+    }
+
+    fn schedule_offline_notice(&mut self, cx: &mut Context<Self>) {
+        self.offline_generation = self.offline_generation.wrapping_add(1);
+        let generation = self.offline_generation;
+        cx.spawn(async move |session, cx| {
+            cx.background_executor().timer(OFFLINE_NOTICE_GRACE).await;
+            let _ = session.update(cx, |session, cx| {
+                if session.stale
+                    && !session.offline_notified
+                    && session.offline_generation == generation
+                {
+                    session.notify_offline_now();
+                    cx.emit(SessionSignal::Stale);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 视图即将进入离线态：快照中的运行态作废（晚打开的视图也不显示过期速度）。
+    fn notify_offline_now(&mut self) {
+        self.stale = true;
+        self.offline_notified = true;
+        self.offline_generation = self.offline_generation.wrapping_add(1);
         if let Some(snapshot) = self.latest.as_mut()
             && let SnapshotBody::Agent(body) = &mut Arc::make_mut(snapshot).body
         {
@@ -132,18 +189,20 @@ pub fn attach<V: SessionConsumer>(session: &Entity<AgentSession>, view: &Entity<
                     view.replace_snapshot(body, cx);
                 }
             }
-            SessionSignal::Stale | SessionSignal::Fatal(_) => view.mark_stale(cx),
+            SessionSignal::Stale | SessionSignal::Fatal(_) | SessionSignal::ServiceStopped => {
+                view.mark_stale(cx);
+            }
         })
         .detach();
     });
-    let (latest, stale) = {
+    let (latest, offline) = {
         let session = session.read(cx);
-        (session.latest.clone(), session.stale)
+        (session.latest.clone(), session.offline_notified)
     };
     if let Some(body) = latest.as_deref().and_then(agent_body) {
         view.update(cx, |view, cx| view.replace_snapshot(body, cx));
     }
-    if stale {
+    if offline {
         view.update(cx, |view, cx| view.mark_stale(cx));
     }
 }
@@ -202,7 +261,6 @@ macro_rules! forward_consumer {
 
 forward_consumer!(
     fluxdown_ui_downloads::DownloadView,
-    fluxdown_ui_downloads::QuickCaptureView,
     fluxdown_ui_downloads::QueueManagerView,
     fluxdown_ui_downloads::TaskDetailView,
     fluxdown_ui_downloads::GroupDetailView,

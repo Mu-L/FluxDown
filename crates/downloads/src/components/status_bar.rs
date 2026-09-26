@@ -2,8 +2,8 @@
 //!
 //! 限速走 `DownloadsCommand::PatchConfig`（键 `speed_limit_bytes` /
 //! `upload_limit_bytes`，单位字节/秒，见 `native/protocol/src/daemon_config.rs`）；
-//! 完成后关机走宿主注入的 `ShutdownPort`（状态机与真正执行由 app 侧
-//! `power::ShutdownScheduler` 拥有，本文件只发请求 + 每秒刷新倒计时显示）。
+//! 完成后关机走宿主注入的 `ShutdownPort`（状态机与真正执行归 agent，本文件只发请求 +
+//! 刷新倒计时显示）。
 
 use std::{collections::BTreeMap, rc::Rc, time::Duration};
 

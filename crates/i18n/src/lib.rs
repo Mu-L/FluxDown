@@ -256,6 +256,25 @@ impl Translator {
     }
 }
 
+/// 系统界面语言：`LC_ALL` → `LC_MESSAGES` → `LANG` 中第一个非空值，去掉编码后缀；
+/// `C` / `POSIX` 或都未设置时为 `en`。偏好 `general.locale` 为 `system` 时使用，桌面、
+/// 设置页与 agent 托盘共用同一推导，保证文案同语言。
+#[must_use]
+pub fn system_locale() -> String {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find(|value| !value.trim().is_empty())
+        .and_then(|value| {
+            value
+                .split('.')
+                .next()
+                .map(|locale| locale.trim().to_owned())
+        })
+        .filter(|locale| !locale.is_empty() && locale != "C" && locale != "POSIX")
+        .unwrap_or_else(|| "en".to_owned())
+}
+
 fn normalize_locale(locale: &str) -> String {
     locale.trim().to_ascii_lowercase().replace('_', "-")
 }

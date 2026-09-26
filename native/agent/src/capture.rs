@@ -1,12 +1,13 @@
 //! 浏览器/NMH 捕获确认事务：内存有界、单次消费且不持久化敏感请求上下文。
+//!
+//! Cookie / 请求头 / 请求体只留在事务里；官方 UI 只拿到 [`PendingCaptureDto`] 摘要，
+//! 确认时提交表单产出的 [`CreateTaskRequest`]，由 [`merge_confirmed_request`] 以捕获原请求为底合并。
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 
 use fluxdown_protocol::{
-    AgentEvent, CaptureOverridesDto, CreateTaskRequest, DaemonCreateTaskParams, DownloadRequest,
-    PendingCaptureDto,
+    AgentEvent, CreateTaskRequest, DaemonCreateTaskParams, DownloadRequest, PendingCaptureDto,
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -14,6 +15,7 @@ use uuid::Uuid;
 
 use crate::daemon_client::DaemonClient;
 use crate::event_hub::AgentEventHub;
+use crate::shell::ShellState;
 
 const CAPTURE_CAPACITY: usize = 64;
 
@@ -26,22 +28,18 @@ pub struct CaptureService {
     daemon: Arc<DaemonClient>,
     events: AgentEventHub,
     pending: Mutex<VecDeque<CaptureTransaction>>,
-    /// 已连接并声明 `client.selections` 能力的 UI 客户端数量（与 `GatewayService` 共享）。
-    ui_clients: Arc<AtomicUsize>,
+    /// 待确认捕获入队时按需拉起官方 UI。
+    shell: Arc<ShellState>,
 }
 
 impl CaptureService {
     #[must_use]
-    pub fn new(
-        daemon: Arc<DaemonClient>,
-        events: AgentEventHub,
-        ui_clients: Arc<AtomicUsize>,
-    ) -> Self {
+    pub fn new(daemon: Arc<DaemonClient>, events: AgentEventHub, shell: Arc<ShellState>) -> Self {
         Self {
             daemon,
             events,
             pending: Mutex::new(VecDeque::with_capacity(CAPTURE_CAPACITY)),
-            ui_clients,
+            shell,
         }
     }
 
@@ -52,16 +50,11 @@ impl CaptureService {
         silent: bool,
     ) -> Result<Value, CaptureError> {
         if silent {
-            return self.create(request, None, true, None).await;
+            return self
+                .create(captured_create_request(request), None, true)
+                .await;
         }
-        let public = PendingCaptureDto {
-            transaction_id: Uuid::new_v4().to_string(),
-            url: request.url.clone(),
-            file_name: request.filename.clone(),
-            created_at_unix_ms: now_unix_ms(),
-            file_size: request.file_size.unwrap_or(0).max(0),
-            referrer: request.referrer.clone(),
-        };
+        let public = pending_capture_dto(&request);
         let first = {
             let mut pending = self.pending.lock().await;
             if pending.len() >= CAPTURE_CAPACITY {
@@ -75,8 +68,8 @@ impl CaptureService {
             first
         };
         self.publish().await;
-        if first && let Err(error) = crate::platform::launch_desktop_for_capture(&self.ui_clients) {
-            tracing::warn!(error = %error, "could not launch desktop for pending capture");
+        if first {
+            self.shell.launch_for_prompt();
         }
         Ok(json!({ "transactionId": public.transaction_id }))
     }
@@ -89,8 +82,12 @@ impl CaptureService {
         torrent_blob_id: String,
         unattended: bool,
     ) -> Result<Value, CaptureError> {
-        self.create(request, Some(torrent_blob_id), unattended, None)
-            .await
+        self.create(
+            captured_create_request(request),
+            Some(torrent_blob_id),
+            unattended,
+        )
+        .await
     }
 
     pub async fn list(&self) -> Vec<PendingCaptureDto> {
@@ -102,12 +99,13 @@ impl CaptureService {
             .collect()
     }
 
-    /// 确认/拒绝均只消费一次；`overrides` 仅在 `accepted` 时按非空字段覆盖原始捕获请求。
+    /// 确认/拒绝均只消费一次；确认时 `confirmed`（官方 UI 表单结果）经
+    /// [`merge_confirmed_request`] 合并进捕获原请求，`None` 按原请求建任务。
     pub async fn resolve(
         &self,
         transaction_id: &str,
         accepted: bool,
-        overrides: Option<CaptureOverridesDto>,
+        confirmed: Option<CreateTaskRequest>,
     ) -> Result<Value, CaptureError> {
         let transaction = {
             let mut pending = self.pending.lock().await;
@@ -118,27 +116,27 @@ impl CaptureService {
             pending.remove(index).ok_or(CaptureError::NotFound)?
         };
         self.publish().await;
-        if accepted {
-            self.create(transaction.request, None, false, overrides)
-                .await
-        } else {
-            Ok(json!({ "accepted": false }))
+        if !accepted {
+            return Ok(json!({ "accepted": false }));
         }
+        let request = match confirmed {
+            Some(confirmed) => merge_confirmed_request(transaction.request, confirmed),
+            None => captured_create_request(transaction.request),
+        };
+        self.create(request, None, false).await
     }
 
     async fn create(
         &self,
-        request: DownloadRequest,
+        request: CreateTaskRequest,
         torrent_blob_id: Option<String>,
         unattended: bool,
-        overrides: Option<CaptureOverridesDto>,
     ) -> Result<Value, CaptureError> {
-        let create = build_create_request(request, overrides.as_ref())?;
         self.daemon
             .call(
                 fluxdown_protocol::method::DAEMON_TASK_CREATE,
                 Some(DaemonCreateTaskParams {
-                    request: create,
+                    request,
                     torrent_blob_id,
                     unattended,
                 }),
@@ -153,37 +151,96 @@ impl CaptureService {
     }
 }
 
-/// 按非空覆盖字段合并进原始捕获请求，构造 `daemon.task.create` 参数。
-/// `queueId`/`segments` 不属于 [`DownloadRequest`]，只能通过覆盖指定。
-fn build_create_request(
-    mut request: DownloadRequest,
-    overrides: Option<&CaptureOverridesDto>,
-) -> Result<CreateTaskRequest, serde_json::Error> {
-    let mut queue_id = String::new();
-    let mut segments = 0_i32;
-    if let Some(overrides) = overrides {
-        if !overrides.save_dir.is_empty() {
-            request.save_dir = overrides.save_dir.clone();
-        }
-        if !overrides.file_name.is_empty() {
-            request.filename = overrides.file_name.clone();
-        }
-        queue_id = overrides.queue_id.clone();
-        segments = overrides.segments;
+/// 捕获请求 → UI 可见摘要：只暴露头名与是否带 Cookie，不含任何值。
+fn pending_capture_dto(request: &DownloadRequest) -> PendingCaptureDto {
+    let mut header_names = request
+        .headers
+        .iter()
+        .flatten()
+        .map(|(name, _)| name.clone())
+        .filter(|name| !name.eq_ignore_ascii_case("cookie"))
+        .collect::<Vec<_>>();
+    header_names.sort_by_key(|name| name.to_ascii_lowercase());
+    let cookie_header = request
+        .headers
+        .iter()
+        .flatten()
+        .any(|(name, value)| name.eq_ignore_ascii_case("cookie") && !value.trim().is_empty());
+    PendingCaptureDto {
+        transaction_id: Uuid::new_v4().to_string(),
+        url: request.url.clone(),
+        file_name: request.filename.clone(),
+        created_at_unix_ms: now_unix_ms(),
+        file_size: request.file_size.unwrap_or(0).max(0),
+        referrer: request.referrer.clone(),
+        save_dir: request.save_dir.clone(),
+        has_cookies: !request.cookies.trim().is_empty() || cookie_header,
+        header_names,
     }
-    serde_json::from_value(json!({
-        "url": request.url,
-        "fileName": request.filename,
-        "saveDir": request.save_dir,
-        "referrer": request.referrer,
-        "cookies": request.cookies,
-        "headers": request.headers,
-        "method": request.method,
-        "body": request.body,
-        "audioUrl": request.audio_url,
-        "queueId": queue_id,
-        "segments": segments,
-    }))
+}
+
+/// 按捕获原请求建任务（静默提交 / 未带表单结果的确认）；队列与分段走 daemon 默认。
+fn captured_create_request(request: DownloadRequest) -> CreateTaskRequest {
+    CreateTaskRequest {
+        url: request.url,
+        file_name: request.filename,
+        save_dir: request.save_dir,
+        segments: 0,
+        cookies: request.cookies,
+        referrer: request.referrer,
+        proxy_url: String::new(),
+        user_agent: String::new(),
+        queue_id: String::new(),
+        checksum: String::new(),
+        ignore_tls_errors: false,
+        headers: request.headers,
+        torrent_b64: None,
+        method: request.method,
+        body: request.body,
+        audio_url: request.audio_url,
+        start_paused: false,
+        http_user: String::new(),
+        http_password: String::new(),
+        save_site_auth: false,
+    }
+}
+
+/// 官方 UI 表单结果合并进捕获原请求（规则见 `CaptureResolveParams::request`）。
+///
+/// 表单看不到的请求上下文（method / body / 音频轨）与事务身份（url）恒取捕获值；
+/// 表单留空的字段回退捕获值；请求头以捕获为底、表单同名覆盖，表单填了 UA 时去掉
+/// 捕获的 `User-Agent` 头。表单的 HTTP 认证原样保留：引擎对非空 `httpUser` 注入的
+/// `Authorization` 会覆盖捕获头，留空则沿用浏览器头 / 已保存站点凭据。
+fn merge_confirmed_request(
+    captured: DownloadRequest,
+    mut confirmed: CreateTaskRequest,
+) -> CreateTaskRequest {
+    let base = captured_create_request(captured);
+    confirmed.url = base.url;
+    confirmed.method = base.method;
+    confirmed.body = base.body;
+    confirmed.audio_url = base.audio_url;
+    confirmed.torrent_b64 = None;
+    fill_if_blank(&mut confirmed.file_name, base.file_name);
+    fill_if_blank(&mut confirmed.save_dir, base.save_dir);
+    fill_if_blank(&mut confirmed.cookies, base.cookies);
+    fill_if_blank(&mut confirmed.referrer, base.referrer);
+    let mut headers = base.headers.unwrap_or_default();
+    if !confirmed.user_agent.trim().is_empty() {
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("user-agent"));
+    }
+    for (name, value) in confirmed.headers.take().unwrap_or_default() {
+        headers.retain(|existing, _| !existing.eq_ignore_ascii_case(&name));
+        headers.insert(name, value);
+    }
+    confirmed.headers = (!headers.is_empty()).then_some(headers);
+    confirmed
+}
+
+fn fill_if_blank(target: &mut String, fallback: String) {
+    if target.trim().is_empty() {
+        *target = fallback;
+    }
 }
 
 fn now_unix_ms() -> i64 {
@@ -300,58 +357,125 @@ pub enum BlobError {
 
 #[cfg(test)]
 mod tests {
-    use fluxdown_protocol::CaptureOverridesDto;
+    use std::collections::HashMap;
 
-    use super::{DownloadRequest, build_create_request};
+    use fluxdown_protocol::{CreateTaskRequest, RequestBody};
+    use serde_json::json;
 
-    fn sample_request() -> DownloadRequest {
+    use super::{DownloadRequest, merge_confirmed_request, pending_capture_dto};
+
+    fn captured() -> DownloadRequest {
         DownloadRequest {
             url: "https://example.com/a.bin".to_owned(),
             filename: "a.bin".to_owned(),
-            save_dir: String::new(),
-            referrer: String::new(),
-            cookies: String::new(),
-            headers: None,
-            file_size: None,
+            save_dir: "/captured".to_owned(),
+            referrer: "https://example.com/page".to_owned(),
+            cookies: "sid=1".to_owned(),
+            headers: Some(HashMap::from([
+                ("User-Agent".to_owned(), "Browser/1".to_owned()),
+                ("Authorization".to_owned(), "Basic YTpi".to_owned()),
+                ("Accept".to_owned(), "*/*".to_owned()),
+            ])),
+            file_size: Some(-1),
             mime_type: None,
-            method: None,
-            body: None,
-            audio_url: None,
+            method: Some("POST".to_owned()),
+            body: Some(RequestBody::Urlencoded {
+                raw: "k=v".to_owned(),
+            }),
+            audio_url: Some("https://example.com/a.m4a".to_owned()),
         }
     }
 
-    #[test]
-    fn resolve_overrides_apply_to_created_request() {
-        let overrides = CaptureOverridesDto {
-            save_dir: "/tmp/renamed".to_owned(),
-            file_name: "renamed.bin".to_owned(),
-            queue_id: "later".to_owned(),
-            segments: 4,
-        };
-        let created =
-            build_create_request(sample_request(), Some(&overrides)).expect("build create request");
-        assert_eq!(created.file_name, "renamed.bin");
-        assert_eq!(created.save_dir, "/tmp/renamed");
-        assert_eq!(created.queue_id, "later");
-        assert_eq!(created.segments, 4);
-        assert_eq!(created.url, "https://example.com/a.bin");
+    fn form(value: serde_json::Value) -> CreateTaskRequest {
+        serde_json::from_value(value).expect("form request")
     }
 
     #[test]
-    fn missing_overrides_keep_original_request_and_leave_queue_and_segments_default() {
-        let created = build_create_request(sample_request(), None).expect("build create request");
-        assert_eq!(created.file_name, "a.bin");
-        assert_eq!(created.save_dir, "");
-        assert_eq!(created.queue_id, "");
-        assert_eq!(created.segments, 0);
+    fn pending_summary_exposes_header_names_but_no_secret_values() {
+        let dto = pending_capture_dto(&captured());
+        assert_eq!(dto.header_names, ["Accept", "Authorization", "User-Agent"]);
+        assert!(dto.has_cookies);
+        assert!(dto.has_authorization());
+        assert_eq!(dto.file_size, 0);
+        let wire = serde_json::to_string(&dto).expect("serialize summary");
+        assert!(!wire.contains("sid=1"));
+        assert!(!wire.contains("YTpi"));
     }
 
     #[test]
-    fn empty_override_fields_fall_back_to_original_request() {
-        let overrides = CaptureOverridesDto::default();
-        let created =
-            build_create_request(sample_request(), Some(&overrides)).expect("build create request");
-        assert_eq!(created.file_name, "a.bin");
-        assert_eq!(created.save_dir, "");
+    fn blank_form_keeps_captured_context_and_form_choices() {
+        let merged = merge_confirmed_request(
+            captured(),
+            form(json!({
+                "url": "https://evil.example/other",
+                "queueId": "later",
+                "segments": 8,
+                "startPaused": true,
+            })),
+        );
+        assert_eq!(merged.url, "https://example.com/a.bin");
+        assert_eq!(merged.file_name, "a.bin");
+        assert_eq!(merged.save_dir, "/captured");
+        assert_eq!(merged.cookies, "sid=1");
+        assert_eq!(merged.referrer, "https://example.com/page");
+        assert_eq!(merged.method.as_deref(), Some("POST"));
+        assert!(matches!(merged.body, Some(RequestBody::Urlencoded { .. })));
+        assert_eq!(
+            merged.audio_url.as_deref(),
+            Some("https://example.com/a.m4a")
+        );
+        assert_eq!(merged.queue_id, "later");
+        assert_eq!(merged.segments, 8);
+        assert!(merged.start_paused);
+        let headers = merged.headers.expect("captured headers kept");
+        assert_eq!(
+            headers.get("User-Agent").map(String::as_str),
+            Some("Browser/1")
+        );
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Basic YTpi")
+        );
+    }
+
+    #[test]
+    fn form_values_override_captured_context_case_insensitively() {
+        let merged = merge_confirmed_request(
+            captured(),
+            form(json!({
+                "url": "https://example.com/a.bin",
+                "fileName": "renamed.bin",
+                "saveDir": "/chosen",
+                "cookies": "sid=2",
+                "userAgent": "Custom/2",
+                "headers": { "accept": "application/octet-stream", "X-Extra": "1" },
+                "httpUser": "alice",
+                "httpPassword": "secret",
+                "saveSiteAuth": true,
+            })),
+        );
+        assert_eq!(merged.file_name, "renamed.bin");
+        assert_eq!(merged.save_dir, "/chosen");
+        assert_eq!(merged.cookies, "sid=2");
+        assert_eq!(merged.user_agent, "Custom/2");
+        assert_eq!(merged.http_user, "alice");
+        assert!(merged.save_site_auth);
+        let headers = merged.headers.expect("merged headers");
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("user-agent")),
+            "form UA replaces captured User-Agent header"
+        );
+        assert!(!headers.contains_key("Accept"));
+        assert_eq!(
+            headers.get("accept").map(String::as_str),
+            Some("application/octet-stream")
+        );
+        assert_eq!(headers.get("X-Extra").map(String::as_str), Some("1"));
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Basic YTpi")
+        );
     }
 }

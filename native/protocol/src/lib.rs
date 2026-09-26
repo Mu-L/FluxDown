@@ -3,6 +3,7 @@
 //! 本 crate 只定义 wire 契约；不得依赖下载引擎、网络运行时、数据库或 UI。
 
 pub mod agent;
+pub mod capture_link;
 pub mod daemon;
 pub mod daemon_config;
 pub mod error;
@@ -17,16 +18,17 @@ pub use task_activity::{
 
 pub use agent::{
     AgentLoginResult, AgentPreferencesDto, AgentSessionDto, AuthVerificationDto,
-    CUSTOM_CATEGORIES_PREF_KEY, CaptureOverridesDto, CaptureResolveParams, CloudDevice,
-    CloudEndpointDto, CloudEndpointSetParams, CloudOrder, CloudPlan, CloudPlanCampaign,
-    CloudPlanCampaignStage, CloudProfile, CloudReferralCode, CloudReferralCodesResult,
-    CloudReferralRecord, CloudReferralRecordsResult, CloudReferralRule, CloudReferralSummary,
+    CUSTOM_CATEGORIES_PREF_KEY, CaptureResolveParams, CloudDevice, CloudEndpointDto,
+    CloudEndpointSetParams, CloudOrder, CloudPlan, CloudPlanCampaign, CloudPlanCampaignStage,
+    CloudProfile, CloudReferralCode, CloudReferralCodesResult, CloudReferralRecord,
+    CloudReferralRecordsResult, CloudReferralRule, CloudReferralSummary,
     CloudReferralValidateResult, CloudUser, CloudUserStatus, CustomCategoryDto, DiagnosticCheckDto,
     DiagnosticLevel, DiagnosticRepairParams, DiagnosticsReportDto, Entitlements,
     GatewayPatchParams, GatewayStatusDto, LogExportParams, LogExportResult, LogPathsDto,
     OriginIdCheckResult, PendingCaptureDto, PlatformIntegrationDto, PlatformOpenPathParams,
-    PlatformToggleParams, PlatformUrlProtocolParams, ReleaseNoteDto, RemoteTaskDto,
-    RemoteTaskStatus, SyncStatusDto, UpdateCheckParams, UpdateCheckResultDto,
+    PlatformToggleParams, PlatformUrlProtocolParams, PowerArmParams, PowerStatusDto,
+    ReleaseNoteDto, RemoteTaskDto, RemoteTaskStatus, ShellStatusDto, SyncStatusDto,
+    TrayUnavailableReason, UpdateCheckParams, UpdateCheckResultDto,
 };
 pub use daemon::{
     ApiInfo, BtFileDto, CdnConfigApplyParams, CdnNodeDto, CdnReportAckParams, CdnReportLeaseDto,
@@ -50,10 +52,10 @@ pub use daemon::{
     RssItemActionRequest, RssItemDto, RssSourceDto, RssValidateRequest, RssValidateResponse,
     SegmentDetailDto, SelectionKind, SelectionOutcome, SelectionRequestDto, SelectionResolutionDto,
     SetPluginEnabledRequest, SettingFieldDto, SettingOptionDto, SetupRequest, SetupStatusResponse,
-    SiteAuthDeleteParams, SiteAuthEntryDto, StatsResponse, SystemProxyDto, TaskDto, TokenResponse,
-    TrackerSubRefreshResponse, UpdateQueueRequest, WebhookDeliveriesResponse, WebhookDeliveryDto,
-    WebhookPresetDto, WebhookSimulateResponse, WebhookTestRequest, WebhookTestResponse,
-    WsClientMsg, WsServerMsg,
+    SiteAuthCredentialDto, SiteAuthDeleteParams, SiteAuthEntryDto, SiteAuthMatchParams,
+    StatsResponse, SystemProxyDto, TaskDto, TokenResponse, TrackerSubRefreshResponse,
+    UpdateQueueRequest, WebhookDeliveriesResponse, WebhookDeliveryDto, WebhookPresetDto,
+    WebhookSimulateResponse, WebhookTestRequest, WebhookTestResponse, WsClientMsg, WsServerMsg,
 };
 pub use daemon_config::{
     BT_MSE_MODES, BT_SEED_LIMIT_OPERATORS, BT_SEED_THEN_ACTIONS, BT_SEED_TIME_UNITS,
@@ -71,9 +73,10 @@ pub use event::{
     SnapshotBody, accepted_runtime_status, apply_agent_event, apply_daemon_event,
 };
 pub use rpc::{
-    ClientHello, JSONRPC_VERSION, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, RequestId,
-    RpcFailureResponse, RpcIncoming, RpcNotification, RpcRequest, RpcResponse, RpcSuccessResponse,
-    ServiceHello, ServiceRole, negotiate_protocol, validate_first_request,
+    CLOSE_REASON_SERVICE_QUIT, ClientHello, JSONRPC_VERSION, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION, RequestId, RpcFailureResponse, RpcIncoming, RpcNotification, RpcRequest,
+    RpcResponse, RpcSuccessResponse, ServiceHello, ServiceRole, negotiate_protocol,
+    validate_first_request,
 };
 pub use settings::{
     SYNC_SETTING_SPECS, SettingOwner, SettingSpec, SettingValueKind, daemon_config_to_value,

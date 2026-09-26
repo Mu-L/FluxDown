@@ -3,6 +3,10 @@
 pub const SYSTEM_HELLO: &str = "system.hello";
 pub const SYSTEM_PING: &str = "system.ping";
 pub const SYSTEM_SNAPSHOT: &str = "system.snapshot";
+/// 让服务优雅退出：daemon 关停引擎后退出；agent 先关停 daemon 再退出（完全退出）。
+///
+/// 允许作为连接首帧（握手前）调用：协议版本不兼容的新旧进程替换只能靠它完成。
+pub const SYSTEM_SHUTDOWN: &str = "system.shutdown";
 
 pub const DAEMON_TASK_LIST: &str = "daemon.task.list";
 pub const DAEMON_TASK_GET: &str = "daemon.task.get";
@@ -44,6 +48,8 @@ pub const DAEMON_CONFIG_SYSTEM_PROXY: &str = "daemon.config.systemProxy";
 pub const DAEMON_SITE_AUTH_LIST: &str = "daemon.siteAuth.list";
 pub const DAEMON_SITE_AUTH_DELETE: &str = "daemon.siteAuth.delete";
 pub const DAEMON_SITE_AUTH_CLEAR: &str = "daemon.siteAuth.clear";
+/// 按下载链接匹配已保存的站点凭据（含明文密码，仅供本机官方 UI 表单回填）。
+pub const DAEMON_SITE_AUTH_MATCH: &str = "daemon.siteAuth.match";
 pub const DAEMON_RUNTIME_STATS: &str = "daemon.runtime.stats";
 pub const DAEMON_FS_LIST: &str = "daemon.fs.list";
 
@@ -159,6 +165,9 @@ pub const AGENT_DIAGNOSTICS_REPAIR: &str = "agent.diagnostics.repair";
 pub const AGENT_DIAGNOSTICS_LOG_PATHS: &str = "agent.diagnostics.logPaths";
 pub const AGENT_DIAGNOSTICS_EXPORT_LOGS: &str = "agent.diagnostics.exportLogs";
 pub const AGENT_UPDATE_CHECK: &str = "agent.update.check";
+/// 完成后关机：`{delaySecs}`；无活跃任务时拒绝（`InvalidArgument`）。
+pub const AGENT_POWER_ARM: &str = "agent.power.arm";
+pub const AGENT_POWER_DISARM: &str = "agent.power.disarm";
 
 pub const SERVICE_EVENT: &str = "service.event";
 
@@ -187,6 +196,7 @@ pub const ALL_METHODS: &[&str] = &[
     SYSTEM_HELLO,
     SYSTEM_PING,
     SYSTEM_SNAPSHOT,
+    SYSTEM_SHUTDOWN,
     DAEMON_TASK_LIST,
     DAEMON_TASK_GET,
     DAEMON_TASK_ACTIVITY,
@@ -224,6 +234,7 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_SITE_AUTH_LIST,
     DAEMON_SITE_AUTH_DELETE,
     DAEMON_SITE_AUTH_CLEAR,
+    DAEMON_SITE_AUTH_MATCH,
     DAEMON_RUNTIME_STATS,
     DAEMON_FS_LIST,
     DAEMON_RSS_LIST_SOURCES,
@@ -325,6 +336,8 @@ pub const ALL_METHODS: &[&str] = &[
     AGENT_DIAGNOSTICS_LOG_PATHS,
     AGENT_DIAGNOSTICS_EXPORT_LOGS,
     AGENT_UPDATE_CHECK,
+    AGENT_POWER_ARM,
+    AGENT_POWER_DISARM,
     SERVICE_EVENT,
 ];
 

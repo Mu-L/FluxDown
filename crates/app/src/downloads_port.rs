@@ -161,6 +161,10 @@ impl DownloadsPort for AgentDownloadsPort {
                 DownloadsCommand::CaptureResolve(params) => {
                     (method::AGENT_CAPTURE_RESOLVE, serialize(params)?)
                 }
+                DownloadsCommand::SiteAuthMatch { url } => (
+                    method::DAEMON_SITE_AUTH_MATCH,
+                    serialize(fluxdown_protocol::SiteAuthMatchParams { url })?,
+                ),
                 DownloadsCommand::RemoteDispatch(params) => (method::AGENT_REMOTE_DISPATCH, params),
                 DownloadsCommand::RemoteCommand(params) => (method::AGENT_REMOTE_COMMAND, params),
                 DownloadsCommand::OpenTask { task_id } => (

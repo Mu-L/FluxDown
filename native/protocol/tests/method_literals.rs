@@ -10,6 +10,7 @@ fn canonical_method_literals_are_exact_and_unique() {
         "system.hello",
         "system.ping",
         "system.snapshot",
+        "system.shutdown",
         "daemon.task.list",
         "daemon.task.get",
         "daemon.task.activity",
@@ -47,6 +48,7 @@ fn canonical_method_literals_are_exact_and_unique() {
         "daemon.siteAuth.list",
         "daemon.siteAuth.delete",
         "daemon.siteAuth.clear",
+        "daemon.siteAuth.match",
         "daemon.runtime.stats",
         "daemon.fs.list",
         "daemon.rss.listSources",
@@ -148,6 +150,8 @@ fn canonical_method_literals_are_exact_and_unique() {
         "agent.diagnostics.logPaths",
         "agent.diagnostics.exportLogs",
         "agent.update.check",
+        "agent.power.arm",
+        "agent.power.disarm",
         "service.event",
     ];
     assert_eq!(ALL_METHODS, expected);
